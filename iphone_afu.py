@@ -1661,6 +1661,21 @@ INFO_KEYS = [
 ]
 
 
+def collect_device_info(ld: object) -> dict:
+    """Infos device via lockdown (clés manquantes → '—')."""
+    vals = {}
+    allv = getattr(ld, "all_values", None)
+    if isinstance(allv, dict):
+        vals.update(allv)
+    for k in INFO_KEYS:
+        if k not in vals:
+            try:
+                vals[k] = ld.get_value(key=k)
+            except Exception:
+                vals[k] = "—"
+    return {k: vals.get(k, "—") for k in INFO_KEYS}
+
+
 def cli_info(args):
     """Infos détaillées du device via lockdown."""
     ctx = DeviceContext(
@@ -1677,16 +1692,7 @@ def cli_info(args):
             print(f"[!] {e}")
         return
 
-    vals = {}
-    allv = getattr(ld, "all_values", None)
-    if isinstance(allv, dict):
-        vals.update(allv)
-    for k in INFO_KEYS:
-        if k not in vals:
-            try:
-                vals[k] = ld.get_value(key=k)
-            except Exception:
-                vals[k] = "—"
+    vals = collect_device_info(ld)
 
     if RICH:
         t = Table(title="Device")
@@ -1753,6 +1759,287 @@ def cli_syslog(args):
             console.print(f"[red]{msg}[/red]")
         else:
             print(f"[!] {msg}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTO — pipeline plug & play (device → extraction → analyse → rapport)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+AUTO_STAGES = ("info", "apps", "dcim", "backup", "syslog", "scan")
+
+
+def _fmt_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _dir_stats(path: Path) -> tuple[int, int]:
+    """(nombre de fichiers, taille totale) d'un répertoire."""
+    files = 0
+    total = 0
+    if path.is_dir():
+        for p in path.rglob("*"):
+            if p.is_file():
+                files += 1
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+    return files, total
+
+
+def default_record_path() -> Path:
+    """Record AFU persistant par défaut (réutilisé d'un run à l'autre)."""
+    return Path.home() / ".iphone_afu" / "afu_record.json"
+
+
+def _wait_for_device(udid: Optional[str], timeout: int, emit) -> list[dict]:
+    """Attend qu'au moins un device apparaisse (trusted ou non)."""
+    deadline = time.time() + max(timeout, 0)
+    first = True
+    while True:
+        devs = get_connected_devices()
+        if devs:
+            return devs
+        if time.time() >= deadline:
+            return []
+        if first:
+            emit("    Branche l'iPhone (déverrouillé la 1re fois pour le trust)…")
+            first = False
+        time.sleep(2)
+
+
+def _auto_acquire_lockdown(record_path: Optional[Path], password: Optional[str],
+                           udid: Optional[str], wait: int, emit) -> tuple[object, str]:
+    """Obtient un LockdownClient : record existant (AFU) sinon device live + trust + record."""
+    ld = None
+    source = ""
+    if record_path and record_path.exists():
+        try:
+            ld = load_pairing_record(record_path, password=password)
+        except ValueError as e:
+            emit(f"    [!] {e}")
+            ld = None
+        if ld is not None:
+            source = f"record {record_path.name}"
+    if ld is None:
+        devs = _wait_for_device(udid, wait, emit)
+        if not devs:
+            raise RuntimeError(
+                "aucun device détecté — câble data ? USB passthrough activé ? (WSL2: usbipd attach --wsl)"
+            )
+        trusted = [d for d in devs if d["trusted"] and (not udid or d["udid"] == udid)]
+        if trusted:
+            ld = trusted[0]["lockdown"]
+            source = f"device live ({trusted[0]['name']})"
+        else:
+            emit("    Sur l'écran : accepte « Faire confiance » (device déverrouillé)")
+            ld = wait_for_trust(udid, timeout=wait)
+            if ld is None:
+                raise RuntimeError(f"timeout {wait}s — trust non établi")
+            source = "trust live (nouveau pairing)"
+        if record_path:
+            ok = save_pairing_record(ld, record_path, password=password)
+            if ok:
+                target = _encrypted_record_path(record_path) if (password and CRYPTO) else record_path
+                emit(f"    Record sauvegardé → {target}")
+            else:
+                emit("    [!] Impossible de sauvegarder le record")
+    if not tunnel_is_active():
+        emit("    [!] Tunnel RemoteXPC non détecté — lance dans un autre terminal :")
+        emit("        sudo python iphone_afu.py tunnel")
+    return ld, source
+
+
+def run_auto(out_dir: Path, *, udid: Optional[str] = None, record_path: Optional[Path] = None,
+             password: Optional[str] = None, wait: int = 120, skip: tuple = (),
+             backup_encrypted: bool = False, syslog_seconds: int = 10, emit=print) -> dict:
+    """
+    Pipeline plug & play : connexion (record/live), info, apps, dcim, backup, syslog, scan.
+    Écrit out_dir/auto_report.json + fichiers de sortie. Retourne le rapport.
+    """
+    started = time.time()
+    skip = {s.lower() for s in skip}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report = {
+        "started": datetime.now().isoformat(timespec="seconds"),
+        "output_dir": str(out_dir),
+        "device": {"source": None, "udid": udid},
+        "stages": [],
+        "outputs": {},
+        "ok": False,
+    }
+    log.debug(f"run_auto: start → {out_dir} (skip={sorted(skip)})")
+
+    emit(f"[*] Sortie : {out_dir.resolve()}")
+
+    # ── connexion device ──
+    emit("[*] Connexion device…")
+    try:
+        ld, source = _auto_acquire_lockdown(record_path, password, udid, wait, emit)
+        report["device"]["source"] = source
+        emit(f"    ✓ {source}")
+    except Exception as e:
+        log.error(f"run_auto: connexion — {e}")
+        report["stages"].append({"name": "connexion device", "status": "error",
+                                 "detail": str(e), "seconds": 0.0})
+        emit(f"    ✗ {e}")
+        (out_dir / "auto_report.json").write_text(
+            json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        return report
+
+    def stage(name: str, fn):
+        t0 = time.time()
+        emit(f"[*] {name}…")
+        try:
+            detail = fn()
+            report["stages"].append({"name": name, "status": "ok", "detail": detail,
+                                     "seconds": round(time.time() - t0, 1)})
+            emit(f"    ✓ {detail}")
+        except Exception as e:
+            log.error(f"run_auto[{name}]: {e}")
+            report["stages"].append({"name": name, "status": "error", "detail": str(e),
+                                     "seconds": round(time.time() - t0, 1)})
+            emit(f"    ✗ {e}")
+
+    # ── info ──
+    if "info" not in skip:
+        def _info():
+            vals = collect_device_info(ld)
+            (out_dir / "device.json").write_text(
+                json.dumps(vals, indent=2, ensure_ascii=False), encoding="utf-8")
+            report["outputs"]["device.json"] = str(out_dir / "device.json")
+            return f"{vals.get('DeviceName')} — {vals.get('ProductType')} iOS {vals.get('ProductVersion')}"
+        stage("info device", _info)
+
+    # ── apps ──
+    if "apps" not in skip:
+        def _apps():
+            apps = extract_installed_apps(ld)
+            (out_dir / "apps.json").write_text(
+                json.dumps(apps, indent=2, ensure_ascii=False), encoding="utf-8")
+            report["outputs"]["apps.json"] = str(out_dir / "apps.json")
+            return f"{len(apps)} apps installées"
+        stage("apps", _apps)
+
+    # ── dcim ──
+    if "dcim" not in skip:
+        def _dcim():
+            target = out_dir / "dcim"
+            stats = extract_dcim(ld, target)
+            manifest = build_dcim_manifest(target)
+            export_manifest(manifest, target)
+            report["outputs"]["dcim"] = str(target)
+            extra = ""
+            if stats["retries"]:
+                extra += f", {stats['retries']} retries"
+            if stats["errors"]:
+                extra += f", {len(stats['errors'])} erreurs"
+            return f"{stats['files']} fichiers, {_fmt_bytes(stats['bytes'])}{extra}"
+        stage("dcim", _dcim)
+
+    # ── backup ──
+    if "backup" not in skip:
+        def _backup():
+            target = out_dir / "backup"
+            stats = extract_backup(ld, target, encrypted=backup_encrypted)
+            if stats["status"] != "success":
+                raise RuntimeError(stats.get("error") or "backup échoué")
+            files, total = _dir_stats(target)
+            report["outputs"]["backup"] = str(target)
+            return f"{files} fichiers, {_fmt_bytes(total)}"
+        stage("backup", _backup)
+
+    # ── syslog ──
+    if "syslog" not in skip:
+        def _syslog():
+            target = out_dir / "syslog.txt"
+            cmd = ["pymobiledevice3", "syslog", "collect", "--output", str(target)]
+            if udid:
+                cmd += ["--udid", udid]
+            if syslog_seconds:
+                cmd += ["--timeout", str(syslog_seconds)]
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=syslog_seconds + 60)
+            if proc.returncode != 0 or not target.exists():
+                raise RuntimeError((proc.stderr or proc.stdout or "échec")[:200])
+            report["outputs"]["syslog.txt"] = str(target)
+            return f"{target.stat().st_size // 1024}KB ({syslog_seconds}s)"
+        stage("syslog", _syslog)
+
+    # ── scan (analyse du backup) ──
+    if "scan" not in skip:
+        def _scan():
+            target = out_dir / "backup" if (out_dir / "backup").is_dir() else out_dir
+            result = scan_directory(target)
+            (out_dir / "findings.json").write_text(
+                json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+            report["outputs"]["findings.json"] = str(out_dir / "findings.json")
+            highs = len([f for f in result["findings"] if f["severity"] == "HIGH"])
+            return (f"{len(result['findings'])} findings ({highs} HIGH) sur "
+                    f"{result['scanned_files']} fichiers")
+        stage("scan données", _scan)
+
+    report["finished"] = datetime.now().isoformat(timespec="seconds")
+    report["duration_s"] = round(time.time() - started, 1)
+    report["ok"] = all(s["status"] == "ok" for s in report["stages"])
+    (out_dir / "auto_report.json").write_text(
+        json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    log.info(f"run_auto: terminé ok={report['ok']} en {report['duration_s']}s")
+    return report
+
+
+def cli_auto(args):
+    """Plug & Play : détecte, (re)pair si besoin, extrait tout, analyse et rapporte."""
+    if RICH:
+        emit = lambda m: console.print(m, highlight=False)
+    else:
+        emit = print
+
+    out = Path(args.output)
+    skip = tuple(s.strip() for s in (getattr(args, "skip", "") or "").split(",") if s.strip())
+    record_path = Path(args.record) if getattr(args, "record", None) else default_record_path()
+
+    emit("[*] Pipeline AFU automatique — Ctrl+C pour interrompre")
+    report = run_auto(
+        out,
+        udid=getattr(args, "udid", None),
+        record_path=record_path,
+        password=getattr(args, "password", None),
+        wait=args.timeout,
+        skip=skip,
+        backup_encrypted=args.encrypted,
+        syslog_seconds=args.syslog_timeout,
+        emit=emit,
+    )
+
+    if RICH:
+        t = Table(title="Résumé")
+        t.add_column("Étape", style="cyan")
+        t.add_column("Statut", style="bold")
+        t.add_column("Détail")
+        for s in report["stages"]:
+            stat = "[green]✓ OK[/green]" if s["status"] == "ok" else "[red]✗ ÉCHEC[/red]"
+            t.add_row(s["name"], stat, s["detail"][:80])
+        console.print(t)
+        console.print(Panel(
+            "\n".join(f"{k}: {v}" for k, v in report["outputs"].items()) or "—",
+            title=f"Sorties → {out.resolve()}", border_style="green" if report["ok"] else "red",
+        ))
+    else:
+        for s in report["stages"]:
+            print(f"[{'OK' if s['status'] == 'ok' else 'FAIL'}] {s['name']}: {s['detail']}")
+        for k, v in report["outputs"].items():
+            print(f"  {k}: {v}")
+
+    if report["ok"]:
+        emit(f"[+] Terminé en {report.get('duration_s', '?')}s — rapport: {out / 'auto_report.json'}")
+    else:
+        emit(f"[!] Terminé avec erreurs — voir {out / 'auto_report.json'}")
+        sys.exit(1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2135,6 +2422,19 @@ def main():
     p_syslog.add_argument("-o", "--output", default="iphone_syslog.txt", help="Fichier de sortie")
     p_syslog.add_argument("-t", "--timeout", type=int, default=10, help="Durée de collecte (secondes)")
 
+    # auto / plug (pipeline complet)
+    p_auto = sub.add_parser(
+        "auto", aliases=["plug"],
+        help="Plug & Play : détecte, (re)pair, extrait tout (info+apps+dcim+backup+syslog) et analyse",
+    )
+    p_auto.add_argument("-o", "--output", default="./afu_out", help="Répertoire de sortie (défaut ./afu_out)")
+    p_auto.add_argument("-t", "--timeout", type=int, default=120, help="Attente device/trust (secondes)")
+    p_auto.add_argument("--password", help="Mot de passe du record chiffré (.enc)")
+    p_auto.add_argument("--encrypted", action="store_true", help="Garder le backup chiffré")
+    p_auto.add_argument("--skip", help="Étapes à ignorer : info,apps,dcim,backup,syslog,scan")
+    p_auto.add_argument("--syslog-timeout", type=int, default=10, dest="syslog_timeout",
+                        help="Durée de collecte syslog (secondes)")
+
     args = parser.parse_args()
 
     if args.cmd == "check":
@@ -2163,6 +2463,8 @@ def main():
         cli_info(args)
     elif args.cmd == "syslog":
         cli_syslog(args)
+    elif args.cmd in ("auto", "plug"):
+        cli_auto(args)
     elif args.cmd == "tui":
         if not TEXTUAL:
             print("[!] textual manquant — pip install textual")

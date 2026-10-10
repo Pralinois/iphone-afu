@@ -17,6 +17,31 @@ Guide complet de lancement (WSL2 pas-à-pas / VM / natif) : [docs/GUIDE_LANCEMEN
 
 ## Commandes CLI
 
+### 🚀 Plug & Play — une seule commande (recommandé pour tester)
+
+Branche l'iPhone, puis :
+```bash
+python iphone_afu.py auto          # alias: plug
+# ou, sur la VM/WSL (active le venv + diagnostic USB d'abord) :
+bash auto.sh
+```
+
+Le pipeline automatique : détecte le device → attend le trust si nécessaire →
+sauvegarde un record persistant (`~/.iphone_afu/afu_record.json`, réutilisé en AFU
+aux runs suivants) → `info` → `apps` → `dcim` (+manifest) → `backup` → `syslog` →
+`scan` des données sensibles → rapport consolidé.
+
+```bash
+python iphone_afu.py auto -o /data/iphone1          # sortie custom
+python iphone_afu.py auto --skip syslog,backup      # run rapide (dcim+apps+scan)
+python iphone_afu.py auto --encrypted               # garder le backup chiffré
+python iphone_afu.py auto --password "mon secret"   # record chiffré (.enc)
+```
+
+Sorties dans le dossier `-o` (défaut `./afu_out`) : `auto_report.json`,
+`device.json`, `apps.json`, `dcim/` (+manifest), `backup/`, `syslog.txt`,
+`findings.json`. Exit code 1 si une étape échoue.
+
 ### Vérifier l'environnement
 ```bash
 python iphone_afu.py check

@@ -17,7 +17,8 @@
 - **Audit (offline)** : IPA statique — protections Mach-O (PIE/canary/ARC/chiffrement), entitlements, schémas URL, ATS ; analyse AASA (Universal Links) ; scan de secrets (JWT/tokens/clés) dans backups
 - **Bypass** : scripts Frida SSL pinning (SecTrust/SSLHandshake) + détection jailbreak
 - **TUI** : interface Textual (check / pair / dcim / backup / apps / keychain / audit / scan)
-- **Tests** : 28 tests unitaires sans device (`pytest`)
+- **Tests** : 33 tests unitaires sans device (`pytest`)
+- **Auto** : pipeline plug & play en une commande (`auto`/`plug` ou `auto.sh`)
 
 ---
 
@@ -115,6 +116,21 @@ python iphone_afu.py check
 
 ## 6. Première session complète (toutes options)
 
+### 🚀 Le plus simple : tout en une commande
+
+```bash
+python iphone_afu.py auto        # alias: plug — ou: bash auto.sh
+```
+Détecte le device, gère le trust + record persistant, puis enchaîne :
+`info` → `apps` → `dcim` (+manifest) → `backup` → `syslog` → `scan` → rapport
+`auto_report.json`. En AFU (runs suivants), il réutilise automatiquement le record
+`~/.iphone_afu/afu_record.json` — écran verrouillé, rien à faire.
+
+Options utiles : `-o <dir>` (sortie), `--skip syslog,backup` (run rapide),
+`--encrypted` (backup chiffré), `--password` (record chiffré).
+
+### Version manuelle (étape par étape)
+
 ```bash
 # 1) Trust + pairing record (iPhone déverrouillé, accepter "Faire confiance" à l'écran)
 python iphone_afu.py pair -o mon_iphone.json
@@ -140,7 +156,7 @@ sudo python iphone_afu.py tunnel --keep-alive
 # 6) TUI
 python iphone_afu.py tui
 
-# 7) Tests (sans device) — attendu : 28 passed
+# 7) Tests (sans device) — attendu : 33 passed
 python -m pytest tests/
 
 # 8) Hors device — audit de sécurité
@@ -177,10 +193,11 @@ python iphone_afu.py bypass -b com.target.app            # injection directe
 1. `uname -r` → contient `microsoft-standard-WSL2` (ou Linux natif/VM)
 2. `python3 --version` ≥ 3.10
 3. `bash setup.sh` → pas d'erreur bloquante. Les lignes `[!] systemd indisponible` / `[!] Groupe plugdev indisponible` sont **normales** sous WSL sans systemd (presque inoffensives)
-4. `python -m pytest tests/` → **28 passed** (aucun device requis — c'est le premier feu vert)
-5. `usbmuxd` actif + `python iphone_afu.py check` → device visible avec trust ✓
-6. `python check_vm_usb.py` → exit code 0
-7. Première extraction : `pair` → `dcim` → vérifier que `manifest.json` + `manifest.csv` sont écrits dans le dossier de sortie
+4. `python -m pytest tests/` → **33 passed** (aucun device requis — c'est le premier feu vert)
+5. `python iphone_afu.py auto` → pipeline complet une fois le trust accepté (⚠ premier run : accepte « Faire confiance » sur l'écran)
+6. `usbmuxd` actif + `python iphone_afu.py check` → device visible avec trust ✓
+7. `python check_vm_usb.py` → exit code 0
+8. Runs suivants en AFU : `python iphone_afu.py auto` réutilise `~/.iphone_afu/afu_record.json` — écran verrouillé OK ; vérifie `auto_report.json` (stages `ok`) et `dcim/manifest.json`
 
 Erreurs connues par étape : voir §7. Logs détaillés : `~/.iphone_afu/debug.log` (fichier rotatif, console = WARNING+).
 Diagnostic sans device : `python -m pytest tests/` couvre retry AFC, chiffrement, manifest, détection deps.
