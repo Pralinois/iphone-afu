@@ -5,6 +5,12 @@ textual>=0.50.0
 frida-tools>=12.0.0
 cryptography>=42.0.0
 Pillow>=10.0.0
+macholib>=1.16.0
+
+# optionnel — MITM proxy (modules/proxy_setup.py guarded)
+mitmproxy>=10.0.0
+# optionnel — runtime RE (modules/objection_wrapper.py guarded)
+objection>=1.11.0
 
 # tests
 pytest>=7.0.0

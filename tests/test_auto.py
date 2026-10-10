@@ -131,3 +131,45 @@ def test_run_auto_untrusted_device_trust_flow(tmp_path):
                 c.stop()
     assert report["ok"] is True
     assert "trust live" in report["device"]["source"]
+
+
+def test_run_auto_v2_ipa_macho_classdump_and_report(tmp_path):
+    """Pipeline v2 : étapes macho, class-dump, strings-hunt, network-recon et report HTML."""
+    from macho_fixtures import default_info, make_ipa, make_objc_macho
+
+    rec = tmp_path / "rec.json"
+    rec.write_text("{}")
+    out = tmp_path / "out"
+    ipa = make_ipa(tmp_path, make_objc_macho(with_symtab=True), default_info())
+
+    def fake_run(cmd, **kwargs):
+        if "--output" in cmd:
+            target = Path(cmd[cmd.index("--output") + 1])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("dns_query api.target.com type=A\n", encoding="utf-8")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch.object(m, "load_pairing_record", return_value=_fake_ld()), \
+         patch.object(m, "tunnel_is_active", return_value=True), \
+         patch.object(m, "collect_device_info", return_value={"DeviceName": "iPhone 16 Pro",
+                                                              "ProductVersion": "18.4"}), \
+         patch.object(m, "extract_installed_apps", return_value=[]), \
+         patch.object(m, "extract_dcim", return_value={"files": 0, "bytes": 0,
+                                                       "errors": [], "retries": 0}), \
+         patch.object(m, "extract_backup", return_value={"status": "success"}), \
+         patch.object(m.subprocess, "run", side_effect=fake_run), \
+         patch("modules.network_recon.resolve_domains", return_value={}):
+        (out / "backup").mkdir(parents=True)
+        report = run_auto(out, record_path=rec, wait=0, ipa=ipa, emit=NO_EMIT)
+
+    assert report["ok"] is True
+    names = [s["name"] for s in report["stages"]]
+    assert {"macho", "class-dump", "strings-hunt", "network-recon", "report"} <= set(names)
+    for f in ("macho_report.json", "class_dump.json", "network_report.json",
+              "report.html", "auto_report.json"):
+        assert (out / f).exists(), f
+    html = (out / "report.html").read_text(encoding="utf-8")
+    for anchor in ("macho", "network", "auto_report"):
+        assert f'id="{anchor}"' in html
+    assert report["macho"]["arch"] == ["arm64"]
+

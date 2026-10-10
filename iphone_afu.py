@@ -89,8 +89,6 @@ try:
     from rich.table import Table
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
     from rich.panel import Panel
-    from rich.text import Text
-    from rich import print as rprint
     RICH = True
 except ImportError:
     RICH = False
@@ -99,8 +97,8 @@ except ImportError:
 # ─── textual (TUI) ───────────────────────────────────────────────────────────
 try:
     from textual.app import App, ComposeResult
-    from textual.widgets import Header, Footer, Button, Static, Log, ProgressBar, Label, Input
-    from textual.containers import Horizontal, Vertical, ScrollableContainer
+    from textual.widgets import Header, Footer, Button, Static, Log, Label, Input
+    from textual.containers import Horizontal, Vertical
     from textual.reactive import reactive
     from textual.screen import ModalScreen
     TEXTUAL = True
@@ -110,10 +108,9 @@ except ImportError:
 # ─── pymobiledevice3 ─────────────────────────────────────────────────────────
 try:
     from pymobiledevice3.usbmux import list_devices
-    from pymobiledevice3.lockdown import LockdownClient, create_using_usbmux
+    from pymobiledevice3.lockdown import create_using_usbmux
     from pymobiledevice3.services.afc import AfcService
     from pymobiledevice3.services.mobilebackup2 import Mobilebackup2Service
-    from pymobiledevice3.services.os_trace import OsTraceService
     from pymobiledevice3.services.installation_proxy import InstallationProxyService
     PMD3 = True
 except ImportError:
@@ -578,7 +575,7 @@ dumpKeychain();
     result = {"status": "pending", "items": [], "error": None, "by_class": {}}
 
     try:
-        script_path = Path("/tmp/_frida_kc_dump.js")
+        script_path = Path(tempfile.gettempdir()) / "_frida_kc_dump.js"
         script_path.write_text(frida_script)
 
         proc = subprocess.run(
@@ -1011,11 +1008,13 @@ def fetch_aasa(domain: str) -> tuple[int, str, Optional[dict]]:
     base = domain.strip().rstrip("/")
     if not base.startswith("http"):
         base = "https://" + base
+    if not base.lower().startswith(("https://", "http://")):
+        raise RuntimeError(f"schéma non supporté (http/https requis) : {domain}")
     last = (0, "", None)
     for path in ("/.well-known/apple-app-site-association", "/apple-app-site-association"):
         req = urllib.request.Request(base + path, headers={"User-Agent": "iphone-afu/1.0"})
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 — schéma http/https validé ci-dessus
                 body = resp.read()
                 try:
                     data = json.loads(body)
@@ -1761,6 +1760,435 @@ def cli_syslog(args):
             print(f"[!] {msg}")
 
 
+def _module_error(name: str, e: Exception) -> None:
+    msg = f"module {name} indisponible ({e})"
+    if RICH:
+        console.print(f"[red]{msg}[/red]")
+    else:
+        print(f"[!] {msg}")
+
+
+def cli_macho(args):
+    """Analyse Mach-O / IPA — protections + bypass vectors."""
+    try:
+        from modules.macho_analyzer import analyze_macho, render_macho_report
+    except ImportError as e:
+        _module_error("macho_analyzer (pip install macholib)", e)
+        return
+    try:
+        result = analyze_macho(Path(args.target))
+    except RuntimeError as e:
+        if RICH:
+            console.print(f"[red]{e}[/red]")
+        else:
+            print(f"[!] {e}")
+        return
+    report = render_macho_report(result, Path(args.json_out) if args.json_out else None,
+                                 plain=not RICH)
+    if RICH:
+        console.print(report, highlight=False)
+    else:
+        print(report)
+    if args.json_out:
+        msg = f"Rapport JSON → {args.json_out}"
+        if RICH:
+            console.print(f"[green]{msg}[/green]")
+        else:
+            print(f"[+] {msg}")
+
+
+def cli_proxy(args):
+    """MITM proxy (mitmproxy) + bypass SSL pinning Frida."""
+    try:
+        from modules.proxy_setup import (generate_frida_pinning_bypass, generate_mitmproxy_cert,
+                                         get_host_ip, install_cert_on_device,
+                                         print_proxy_instructions, start_mitmproxy)
+    except ImportError as e:
+        _module_error("proxy_setup", e)
+        return
+
+    if getattr(args, "write_bypass", None):
+        out = generate_frida_pinning_bypass(Path(args.write_bypass))
+        msg = f"Script Frida → {out} (frida -U -f <bundle> -l {out})"
+        if RICH:
+            console.print(f"[green]{msg}[/green]")
+        else:
+            print(f"[+] {msg}")
+        return
+
+    host_ip = get_host_ip()
+    if RICH:
+        console.print(f"[cyan]IP host : {host_ip}[/cyan]")
+    else:
+        print(f"[*] IP host : {host_ip}")
+
+    cert_installed = False
+    cert_pem = None
+    if not args.no_cert:
+        try:
+            cert_pem = generate_mitmproxy_cert()
+        except RuntimeError as e:
+            if RICH:
+                console.print(f"[yellow]⚠ {e}[/yellow]")
+            else:
+                print(f"[!] {e}")
+        if cert_pem is not None:
+            devs = get_connected_devices()
+            trusted = [d for d in devs if d["trusted"]]
+            if trusted:
+                cert_installed = install_cert_on_device(trusted[0]["lockdown"], cert_pem)
+                if cert_installed:
+                    if RICH:
+                        console.print("[green]CA installé sur le device[/green]")
+                else:
+                    if RICH:
+                        console.print("[yellow]Installation MDM refusée — .mobileconfig écrit "
+                                      "pour installation manuelle[/yellow]")
+
+    try:
+        proc = start_mitmproxy(args.port,
+                               Path(args.output) if args.output else None,
+                               Path(args.script) if args.script else None)
+    except RuntimeError as e:
+        if RICH:
+            console.print(f"[red]{e}[/red]")
+        else:
+            print(f"[!] {e}")
+        return
+    msg = f"mitmdump actif (pid={proc.pid}, port={args.port})"
+    if RICH:
+        console.print(f"[green]{msg}[/green]")
+    else:
+        print(f"[+] {msg}")
+    print_proxy_instructions(host_ip, args.port, cert_installed)
+
+    bypass_path = Path("afu_bypass_pinning.js")
+    try:
+        generate_frida_pinning_bypass(bypass_path)
+        if RICH:
+            console.print(f"[green]Script bypass → {bypass_path}[/green]")
+        else:
+            print(f"[+] Script bypass → {bypass_path}")
+        if args.frida_bypass and args.bundle_id:
+            from modules.proxy_setup import inject_frida_script
+            result = inject_frida_script(args.bundle_id, bypass_path)
+            if result["status"] in ("success", "injected"):
+                if RICH:
+                    console.print(f"[green]Bypass injecté sur {args.bundle_id}[/green]")
+                else:
+                    print(f"[+] Bypass injecté sur {args.bundle_id}")
+            else:
+                if RICH:
+                    console.print(f"[red]{result['error']}[/red]")
+                else:
+                    print(f"[!] {result['error']}")
+        elif args.frida_bypass:
+            if RICH:
+                console.print("[yellow]--bundle-id requis pour injecter le bypass[/yellow]")
+            else:
+                print("[!] --bundle-id requis pour injecter le bypass")
+    except Exception as e:
+        log.error(f"cli_proxy: bypass — {e}")
+
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        msg = "Arrêt du proxy..."
+        if RICH:
+            console.print(f"[yellow]{msg}[/yellow]")
+        else:
+            print(f"[!] {msg}")
+        proc.terminate()
+
+
+def cli_objection(args):
+    """Wrapper Objection — recon runtime iOS."""
+    try:
+        from modules.objection_wrapper import (OBJECTION_PRESETS, batch_recon,
+                                               check_objection, run_objection_interactive,
+                                               run_objection_preset)
+    except ImportError as e:
+        _module_error("objection_wrapper", e)
+        return
+
+    if not check_objection():
+        msg = "objection non installé — pip install objection"
+        if RICH:
+            console.print(f"[red]{msg}[/red]")
+        else:
+            print(f"[!] {msg}")
+        return
+
+    if args.interactive:
+        run_objection_interactive(args.bundle_id)
+        return
+    if args.batch:
+        out = Path(args.output or "./objection_out")
+        stats = batch_recon(args.bundle_id, out)
+        msg = f"batch: {stats['success']}/{stats['run']} OK → {stats['report']}"
+        if RICH:
+            console.print(f"[green]{msg}[/green]" if stats["failed"] == 0 else f"[yellow]{msg}[/yellow]")
+        else:
+            print(f"[+] {msg}")
+        return
+    if args.objection_cmd:
+        result = run_objection_preset(args.bundle_id, args.objection_cmd, extra_arg=args.arg,
+                                      output_path=Path(args.output) if args.output else None)
+        if RICH:
+            if result["status"] == "success":
+                console.print(result["output"] or "(vide)")
+            else:
+                console.print(f"[red]{result['error']}[/red]")
+        else:
+            print(result["output"] or result["error"] or "")
+        return
+    msg = "Presets: " + ", ".join(OBJECTION_PRESETS)
+    if RICH:
+        console.print(f"[cyan]{msg}[/cyan]")
+    else:
+        print(f"[*] {msg}")
+
+
+def cli_strings_hunt(args):
+    """Secret hunting + score d'obfuscation."""
+    try:
+        from modules.strings_hunter import (SEVERITY_ORDER, compute_obfuscation_score,
+                                            export_findings, scan_directory)
+    except ImportError as e:
+        _module_error("strings_hunter", e)
+        return
+
+    target = Path(args.target)
+    if not target.exists():
+        if RICH:
+            console.print(f"[red]Chemin introuvable : {target}[/red]")
+        else:
+            print(f"[!] Chemin introuvable : {target}")
+        return
+    threshold = 0.0 if args.regex_only else args.entropy
+    exts = args.ext.split(",") if args.ext else None
+    findings = scan_directory(target, entropy_threshold=threshold, extensions=exts)
+
+    if args.obfuscation and target.is_file():
+        obf = compute_obfuscation_score(target)
+        if RICH:
+            console.print(Panel(
+                f"Score : {obf['score']}/100 — {obf['verdict']}\n"
+                + "\n".join(f"• {i}" for i in obf["indicators"]),
+                title="Obfuscation", border_style="magenta"))
+        else:
+            print(f"[*] Obfuscation : {obf['score']}/100 — {obf['verdict']}")
+
+    if RICH:
+        t = Table(title=f"Findings ({len(findings)})")
+        t.add_column("Sev", style="bold")
+        t.add_column("Pattern", style="dim")
+        t.add_column("Fichier:offset")
+        t.add_column("String", style="dim")
+        for f in sorted(findings, key=lambda x: SEVERITY_ORDER.get(x.severity, 9))[:200]:
+            style = SEVERITY_STYLE.get(f.severity, "white")
+            t.add_row(f"[{style}]{f.severity}[/{style}]", f.pattern,
+                      f"{Path(f.file).name}:{f.offset}", f.string[:70])
+        console.print(t)
+    else:
+        for f in findings[:200]:
+            print(f"[{f.severity}] {f.pattern} {f.file}:{f.offset} {f.string[:70]}")
+
+    if args.output:
+        written = export_findings(findings, Path(args.output))
+        msg = "Exports: " + ", ".join(written.values())
+        if RICH:
+            console.print(f"[green]{msg}[/green]")
+        else:
+            print(f"[+] {msg}")
+
+
+def cli_plist_dump(args):
+    """Extraction des 9 data storage locations iOS."""
+    try:
+        from modules.plist_extractor import extract_all_storage, extract_all_storage_afc
+    except ImportError as e:
+        _module_error("plist_extractor", e)
+        return
+
+    out = Path(args.output)
+    if args.afc:
+        ctx = DeviceContext(
+            udid=getattr(args, "udid", None),
+            record_path=Path(args.record) if getattr(args, "record", None) else None,
+            password=getattr(args, "password", None),
+        )
+        try:
+            ld = ctx.resolve()
+            summary = extract_all_storage_afc(ld, out, bundle_id=args.bundle_id)
+        except RuntimeError as e:
+            if RICH:
+                console.print(f"[red]{e}[/red]")
+            else:
+                print(f"[!] {e}")
+            return
+    elif args.backup:
+        try:
+            summary = extract_all_storage(Path(args.backup), out, bundle_id=args.bundle_id)
+        except RuntimeError as e:
+            if RICH:
+                console.print(f"[red]{e}[/red]")
+            else:
+                print(f"[!] {e}")
+            return
+    else:
+        msg = "--backup <dir> ou --afc -b <bundle> requis"
+        if RICH:
+            console.print(f"[red]{msg}[/red]")
+        else:
+            print(f"[!] {msg}")
+        return
+
+    if RICH:
+        t = Table(title="Data storage locations")
+        t.add_column("Location", style="cyan")
+        t.add_column("Trouvé", style="bold")
+        t.add_column("Count")
+        t.add_column("Détail", style="dim")
+        for location, entry in summary.items():
+            found = "[green]✓[/green]" if entry["found"] else "[dim]—[/dim]"
+            t.add_row(location, found, str(entry["count"]), entry["detail"][:60])
+        console.print(t)
+    else:
+        for location, entry in summary.items():
+            print(f"[{'OK' if entry['found'] else '--'}] {location} count={entry['count']}")
+    msg = f"Résumé → {out / 'storage_summary.json'}"
+    if RICH:
+        console.print(f"[green]{msg}[/green]")
+    else:
+        print(f"[+] {msg}")
+
+
+def cli_network_recon(args):
+    """Surface réseau : parse syslog → DNS → GeoIP."""
+    try:
+        from modules.network_recon import (geoip_lookup, generate_network_report,
+                                           parse_syslog_connections, resolve_domains)
+    except ImportError as e:
+        _module_error("network_recon", e)
+        return
+
+    src = Path(args.syslog_file) if args.syslog_file else None
+    if src is None or not src.is_file():
+        msg = "--syslog-parse <fichier> requis (généré par `syslog` ou `auto`)"
+        if RICH:
+            console.print(f"[red]{msg}[/red]")
+        else:
+            print(f"[!] {msg}")
+        return
+
+    connections = parse_syslog_connections(src)
+    resolved = resolve_domains(list(connections["domains"])) if args.resolve else {}
+    geo = geoip_lookup(list(connections["ips"])) if args.geoip else {}
+    summary = generate_network_report(connections, resolved, geo, Path(args.output))
+
+    if RICH:
+        t = Table(title="Top domaines")
+        t.add_column("Hits", style="bold")
+        t.add_column("Domaine", style="cyan")
+        for dom, count in summary["top_5_domains"]:
+            t.add_row(str(count), dom)
+        console.print(f"[cyan]{summary['total_domains']} domaines, "
+                      f"{summary['total_ips']} IPs, "
+                      f"{summary['unique_countries']} pays[/cyan]")
+        console.print(t)
+    else:
+        print(f"[*] {summary['total_domains']} domaines, {summary['total_ips']} IPs")
+        for dom, count in summary["top_5_domains"]:
+            print(f"  {count:5d}  {dom}")
+    msg = f"Rapport → {summary['report']}"
+    if RICH:
+        console.print(f"[green]{msg}[/green]")
+    else:
+        print(f"[+] {msg}")
+
+
+def cli_report(args):
+    """Rapport HTML standalone depuis un répertoire auto."""
+    try:
+        from modules.report_builder import build_html_report
+    except ImportError as e:
+        _module_error("report_builder", e)
+        return
+    try:
+        out = build_html_report(Path(args.source), Path(args.output))
+    except RuntimeError as e:
+        if RICH:
+            console.print(f"[red]{e}[/red]")
+        else:
+            print(f"[!] {e}")
+        return
+    msg = f"Rapport HTML → {out.resolve()}"
+    if RICH:
+        console.print(f"[green]{msg}[/green]")
+    else:
+        print(f"[+] {msg}")
+
+
+def cli_class_dump(args):
+    """Dump statique classes ObjC + symboles Swift."""
+    try:
+        from modules.class_dumper import (dump_objc_classes, extract_swift_symbols,
+                                          materialize_binary, render_class_dump)
+    except ImportError as e:
+        _module_error("class_dumper (pip install macholib)", e)
+        return
+
+    target = Path(args.target)
+    if not target.exists():
+        if RICH:
+            console.print(f"[red]Chemin introuvable : {target}[/red]")
+        else:
+            print(f"[!] Chemin introuvable : {target}")
+        return
+    try:
+        binary, tmp = materialize_binary(target)
+    except RuntimeError as e:
+        if RICH:
+            console.print(f"[red]{e}[/red]")
+        else:
+            print(f"[!] {e}")
+        return
+    try:
+        classes = dump_objc_classes(binary)
+        swift = extract_swift_symbols(binary) if args.swift else []
+    except RuntimeError as e:
+        if RICH:
+            console.print(f"[red]{e}[/red]")
+        else:
+            print(f"[!] {e}")
+        return
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    if args.filter:
+        rx = re.compile(args.filter)
+        classes = [c for c in classes if rx.search(c.name)]
+        swift = [s for s in swift if rx.search(s)]
+
+    if not classes and not swift:
+        msg = "aucune classe ObjC / symbole Swift (binaire strippé, Swift-only ou chiffré ?)"
+        if RICH:
+            console.print(f"[yellow]{msg}[/yellow]")
+        else:
+            print(f"[!] {msg}")
+        return
+
+    text = render_class_dump(classes, swift,
+                             Path(args.output) if args.output else None,
+                             Path(args.json_out) if args.json_out else None)
+    if RICH:
+        console.print(text, highlight=False)
+    else:
+        print(text)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # AUTO — pipeline plug & play (device → extraction → analyse → rapport)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1856,9 +2284,11 @@ def _auto_acquire_lockdown(record_path: Optional[Path], password: Optional[str],
 
 def run_auto(out_dir: Path, *, udid: Optional[str] = None, record_path: Optional[Path] = None,
              password: Optional[str] = None, wait: int = 120, skip: tuple = (),
-             backup_encrypted: bool = False, syslog_seconds: int = 10, emit=print) -> dict:
+             backup_encrypted: bool = False, syslog_seconds: int = 10,
+             ipa: Optional[Path] = None, proxy: bool = False, emit=print) -> dict:
     """
-    Pipeline plug & play : connexion (record/live), info, apps, dcim, backup, syslog, scan.
+    Pipeline plug & play : connexion (record/live), info, apps, dcim, backup, syslog, scan,
+    macho/class-dump (--ipa), strings-hunt, network-recon, rapport HTML.
     Écrit out_dir/auto_report.json + fichiers de sortie. Retourne le rapport.
     """
     started = time.time()
@@ -1873,6 +2303,16 @@ def run_auto(out_dir: Path, *, udid: Optional[str] = None, record_path: Optional
         "ok": False,
     }
     log.debug(f"run_auto: start → {out_dir} (skip={sorted(skip)})")
+
+    proxy_proc = None
+    if proxy:
+        try:
+            from modules.proxy_setup import start_mitmproxy
+            proxy_proc = start_mitmproxy(8080, out_dir / "capture.pcap")
+            report["outputs"]["proxy"] = f"mitmdump pid={proxy_proc.pid} port=8080"
+            emit(f"    Proxy MITM actif (pid={proxy_proc.pid}, port=8080)")
+        except Exception as e:
+            emit(f"    [!] proxy: {e}")
 
     emit(f"[*] Sortie : {out_dir.resolve()}")
 
@@ -1983,6 +2423,95 @@ def run_auto(out_dir: Path, *, udid: Optional[str] = None, record_path: Optional
                     f"{result['scanned_files']} fichiers")
         stage("scan données", _scan)
 
+    # ── macho + class-dump (IPA fourni) ──
+    if ipa is not None and "macho" not in skip:
+        def _macho():
+            from modules.macho_analyzer import analyze_macho, render_macho_report
+            result = analyze_macho(Path(ipa))
+            json_out = out_dir / "macho_report.json"
+            render_macho_report(result, json_out, plain=True)
+            report["outputs"]["macho_report.json"] = str(json_out)
+            report["macho"] = {"arch": result.arch, "pie": result.pie,
+                               "canary": result.stack_canary, "encrypted": result.encrypted,
+                               "findings_bypass": len(result.bypass_vectors)}
+            return (f"{', '.join(result.arch)} — PIE={result.pie} canary={result.stack_canary} "
+                    f"cryptid={result.cryptid}, {len(result.bypass_vectors)} vecteurs bypass")
+        stage("macho", _macho)
+
+    if ipa is not None and "class-dump" not in skip:
+        def _class_dump():
+            from modules.class_dumper import (dump_objc_classes, extract_swift_symbols,
+                                              materialize_binary, render_class_dump)
+            binary, tmp = materialize_binary(Path(ipa))
+            try:
+                classes = dump_objc_classes(binary)
+                swift = extract_swift_symbols(binary)
+            finally:
+                if tmp is not None:
+                    shutil.rmtree(tmp, ignore_errors=True)
+            json_out = out_dir / "class_dump.json"
+            render_class_dump(classes, swift, output_path=out_dir / "class_dump.txt",
+                              json_out=json_out)
+            report["outputs"]["class_dump.json"] = str(json_out)
+            return f"{len(classes)} classes ObjC, {len(swift)} symboles Swift"
+        stage("class-dump", _class_dump)
+
+    # ── strings-hunt (secrets + entropie sur le backup) ──
+    if "strings-hunt" not in skip:
+        def _strings_hunt():
+            from modules.strings_hunter import export_findings, scan_directory
+            target = out_dir / "backup" if (out_dir / "backup").is_dir() else out_dir
+            findings = scan_directory(target, entropy_threshold=4.5)
+            export_dir = out_dir / "strings_hunt"
+            export_findings(findings, export_dir)
+            report["outputs"]["strings_hunt"] = str(export_dir)
+            highs = len([f for f in findings if f.severity == "HIGH"])
+            report["strings_hunt"] = {"total": len(findings), "high": highs}
+            return f"{len(findings)} findings ({highs} HIGH)"
+        stage("strings-hunt", _strings_hunt)
+
+    # ── network-recon (parse syslog + DNS) ──
+    if "network-recon" in skip:
+        pass
+    elif not (out_dir / "syslog.txt").exists():
+        emit("    network-recon ignoré (syslog.txt absent)")
+    else:
+        def _network_recon():
+            from modules.network_recon import (generate_network_report,
+                                               parse_syslog_connections, resolve_domains)
+            syslog_file = out_dir / "syslog.txt"
+            connections = parse_syslog_connections(syslog_file)
+            resolved = resolve_domains(list(connections["domains"]))
+            summary = generate_network_report(connections, resolved, {},
+                                              out_dir / "network")
+            # copie à la racine : attendue par report_builder (network_report.json)
+            shutil.copy2(summary["report"], out_dir / "network_report.json")
+            report["outputs"]["network_report.json"] = str(out_dir / "network_report.json")
+            report["network"] = {k: v for k, v in summary.items() if k != "report"}
+            return (f"{summary['total_domains']} domaines, {summary['total_ips']} IPs, "
+                    f"top={summary['top_5_domains'][0][0] if summary['top_5_domains'] else '—'}")
+        stage("network-recon", _network_recon)
+
+    # ── rapport HTML consolidé ──
+    if "report" not in skip:
+        def _report():
+            from modules.report_builder import build_html_report
+            # instantané du pipeline pour la section "Pipeline Summary" du HTML
+            (out_dir / "auto_report.json").write_text(
+                json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+            out = build_html_report(out_dir, out_dir / "report.html")
+            report["outputs"]["report.html"] = str(out)
+            report["report_path"] = str(out)
+            return f"rapport → {out}"
+        stage("report", _report)
+
+    if proxy_proc is not None:
+        try:
+            proxy_proc.terminate()
+            emit("    Proxy MITM arrêté")
+        except Exception as e:
+            log.debug(f"run_auto: proxy terminate — {e}")
+
     report["finished"] = datetime.now().isoformat(timespec="seconds")
     report["duration_s"] = round(time.time() - started, 1)
     report["ok"] = all(s["status"] == "ok" for s in report["stages"])
@@ -1995,7 +2524,8 @@ def run_auto(out_dir: Path, *, udid: Optional[str] = None, record_path: Optional
 def cli_auto(args):
     """Plug & Play : détecte, (re)pair si besoin, extrait tout, analyse et rapporte."""
     if RICH:
-        emit = lambda m: console.print(m, highlight=False)
+        def emit(m):
+            console.print(m, highlight=False)
     else:
         emit = print
 
@@ -2013,6 +2543,8 @@ def cli_auto(args):
         skip=skip,
         backup_encrypted=args.encrypted,
         syslog_seconds=args.syslog_timeout,
+        ipa=Path(args.ipa) if getattr(args, "ipa", None) else None,
+        proxy=bool(getattr(args, "proxy", False)),
         emit=emit,
     )
 
@@ -2431,9 +2963,76 @@ def main():
     p_auto.add_argument("-t", "--timeout", type=int, default=120, help="Attente device/trust (secondes)")
     p_auto.add_argument("--password", help="Mot de passe du record chiffré (.enc)")
     p_auto.add_argument("--encrypted", action="store_true", help="Garder le backup chiffré")
-    p_auto.add_argument("--skip", help="Étapes à ignorer : info,apps,dcim,backup,syslog,scan")
+    p_auto.add_argument("--skip", help="Étapes à ignorer : info,apps,dcim,backup,syslog,scan,strings-hunt,network-recon,report")
     p_auto.add_argument("--syslog-timeout", type=int, default=10, dest="syslog_timeout",
                         help="Durée de collecte syslog (secondes)")
+    p_auto.add_argument("--ipa", help="IPA local pour analyse statique (macho + class-dump)")
+    p_auto.add_argument("--proxy", action="store_true", help="Lancer le proxy MITM en parallèle")
+
+    # macho
+    p_macho = sub.add_parser("macho", help="Analyse binaire Mach-O / IPA — protections + bypass vectors")
+    p_macho.add_argument("target", help="Chemin vers .ipa ou binaire Mach-O")
+    p_macho.add_argument("--json", dest="json_out", help="Sortie JSON")
+
+    # proxy
+    p_proxy = sub.add_parser("proxy", help="Lance MITM proxy + bypass SSL pinning")
+    p_proxy.add_argument("--port", type=int, default=8080)
+    p_proxy.add_argument("--output", help="Fichier de capture .pcap")
+    p_proxy.add_argument("--script", help="Script mitmproxy addon Python")
+    p_proxy.add_argument("--no-cert", action="store_true", help="Ne pas tenter d'installer le cert CA")
+    p_proxy.add_argument("--frida-bypass", action="store_true",
+                         help="Générer + injecter le script Frida SSL pinning bypass")
+    p_proxy.add_argument("--write-bypass", dest="write_bypass",
+                         help="Écrire le script Frida de bypass puis quitter (sans lancer le proxy)")
+    p_proxy.add_argument("-b", "--bundle-id", dest="bundle_id",
+                         help="Bundle ID pour injection Frida (avec --frida-bypass)")
+
+    # objection
+    p_obj = sub.add_parser("objection", help="Wrapper Objection — recon runtime iOS")
+    p_obj.add_argument("-b", "--bundle-id", required=True, dest="bundle_id")
+    p_obj.add_argument("--cmd", dest="objection_cmd",
+                       help="Preset: cookies, prefs, keychain, pasteboard, env, files, ssl, classes, methods, jailbreak, dump-args")
+    p_obj.add_argument("--arg", help="Argument additionnel pour le preset (ex: pattern pour methods)")
+    p_obj.add_argument("-o", "--output", help="Répertoire de sortie pour batch-recon")
+    p_obj.add_argument("--batch", action="store_true", help="Lance tous les presets en séquence")
+    p_obj.add_argument("--interactive", action="store_true", help="Mode REPL interactif")
+
+    # strings-hunt
+    p_sh = sub.add_parser("strings-hunt", help="Secret hunting + score d'obfuscation")
+    p_sh.add_argument("target", help="Fichier ou répertoire à scanner")
+    p_sh.add_argument("--entropy", type=float, default=4.5, help="Seuil entropie Shannon (0 = désactivé)")
+    p_sh.add_argument("--regex-only", action="store_true", help="Regex patterns seulement, pas d'entropie")
+    p_sh.add_argument("--obfuscation", action="store_true", help="Calculer le score d'obfuscation du binaire")
+    p_sh.add_argument("-o", "--output", help="Répertoire de sortie pour les exports")
+    p_sh.add_argument("--ext", help="Extensions à scanner, séparées par virgule")
+
+    # plist-dump
+    p_pd = sub.add_parser("plist-dump", help="Extrait les 9 locations de data storage iOS")
+    p_pd.add_argument("--backup", help="Chemin vers backup dézippé")
+    p_pd.add_argument("--afc", action="store_true", help="Extraire via AFC (device requis)")
+    p_pd.add_argument("-b", "--bundle-id", dest="bundle_id", help="Filtrer par bundle ID")
+    p_pd.add_argument("-o", "--output", default="./plist_out")
+    p_pd.add_argument("--password", help="Mot de passe du record chiffré (.enc)")
+
+    # network-recon
+    p_nr = sub.add_parser("network-recon", help="Surface réseau — parse syslog + DNS resolution + GeoIP")
+    p_nr.add_argument("--syslog-parse", dest="syslog_file", help="Fichier syslog à parser")
+    p_nr.add_argument("--resolve", action="store_true", help="Résoudre les domaines en DNS")
+    p_nr.add_argument("--geoip", action="store_true", help="Lookup GeoIP (ip-api.com)")
+    p_nr.add_argument("-o", "--output", default="./network_out")
+
+    # report
+    p_report = sub.add_parser("report", help="Génère un rapport HTML standalone depuis auto_out/")
+    p_report.add_argument("source", help="Répertoire de sortie auto")
+    p_report.add_argument("-o", "--output", default="report.html")
+
+    # class-dump
+    p_cd = sub.add_parser("class-dump", help="Dump classes ObjC + symboles Swift statiquement")
+    p_cd.add_argument("target", help=".ipa ou binaire Mach-O")
+    p_cd.add_argument("--swift", action="store_true", help="Inclure les symboles Swift")
+    p_cd.add_argument("--filter", help="Regex filtre sur les noms de classes")
+    p_cd.add_argument("--json", dest="json_out", help="Sortie JSON structurée")
+    p_cd.add_argument("-o", "--output", help="Fichier texte de sortie")
 
     args = parser.parse_args()
 
@@ -2465,6 +3064,22 @@ def main():
         cli_syslog(args)
     elif args.cmd in ("auto", "plug"):
         cli_auto(args)
+    elif args.cmd == "macho":
+        cli_macho(args)
+    elif args.cmd == "proxy":
+        cli_proxy(args)
+    elif args.cmd == "objection":
+        cli_objection(args)
+    elif args.cmd == "strings-hunt":
+        cli_strings_hunt(args)
+    elif args.cmd == "plist-dump":
+        cli_plist_dump(args)
+    elif args.cmd == "network-recon":
+        cli_network_recon(args)
+    elif args.cmd == "report":
+        cli_report(args)
+    elif args.cmd == "class-dump":
+        cli_class_dump(args)
     elif args.cmd == "tui":
         if not TEXTUAL:
             print("[!] textual manquant — pip install textual")

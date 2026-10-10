@@ -29,10 +29,12 @@ bash auto.sh
 Le pipeline automatique : détecte le device → attend le trust si nécessaire →
 sauvegarde un record persistant (`~/.iphone_afu/afu_record.json`, réutilisé en AFU
 aux runs suivants) → `info` → `apps` → `dcim` (+manifest) → `backup` → `syslog` →
-`scan` des données sensibles → rapport consolidé.
+`scan` → `strings-hunt` → `network-recon` → **rapport HTML** → `report.html`.
 
 ```bash
 python iphone_afu.py auto -o /data/iphone1          # sortie custom
+python iphone_afu.py auto --ipa app.ipa             # + macho + class-dump statiques
+python iphone_afu.py auto --proxy                   # + MITM mitmproxy en parallèle
 python iphone_afu.py auto --skip syslog,backup      # run rapide (dcim+apps+scan)
 python iphone_afu.py auto --encrypted               # garder le backup chiffré
 python iphone_afu.py auto --password "mon secret"   # record chiffré (.enc)
@@ -40,7 +42,9 @@ python iphone_afu.py auto --password "mon secret"   # record chiffré (.enc)
 
 Sorties dans le dossier `-o` (défaut `./afu_out`) : `auto_report.json`,
 `device.json`, `apps.json`, `dcim/` (+manifest), `backup/`, `syslog.txt`,
-`findings.json`. Exit code 1 si une étape échoue.
+`findings.json`, `strings_hunt/`, `network_report.json`, `macho_report.json`
+(si `--ipa`), `class_dump.json` (si `--ipa`), `report.html`. Exit code 1 si une
+étape échoue.
 
 ### Vérifier l'environnement
 ```bash
@@ -136,6 +140,70 @@ python iphone_afu.py bypass -b com.target.app
 python iphone_afu.py bypass -b com.target.app --jailbreak
 ```
 
+### Mach-O — analyse binaire complète (offline)
+```bash
+# Protections (PIE/canary/ARC/FairPlay/__RESTRICT/RPATH), entitlements,
+# APIs anti-debug détectées + vecteurs de bypass déduits automatiquement
+python iphone_afu.py macho app.ipa
+python iphone_afu.py macho Payload/Target.app --json macho_report.json
+```
+Skills : binary-protection-bypass + anti-debugging-techniques.
+
+### class-dump — introspection ObjC/Swift statique
+```bash
+# Parse __DATA,__objc_classlist : classes, méthodes, protocoles, ivars, superclasses
+python iphone_afu.py class-dump app.ipa
+python iphone_afu.py class-dump app.ipa --swift --filter "Auth|Login" --json classes.json
+```
+
+### strings-hunt — secrets + score d'obfuscation
+```bash
+# 14 patterns (JWT, AWS, Slack, Firebase, clés privées…) + entropie Shannon
+python iphone_afu.py strings-hunt ./backup_out -o ./hunt_out
+python iphone_afu.py strings-hunt ./binary --obfuscation --entropy 4.0
+```
+Skill : code-obfuscation-deobfuscation.
+
+### plist-dump — les 9 locations de data storage iOS
+```bash
+python iphone_afu.py plist-dump --backup ./backup_out -o ./plist_out
+python iphone_afu.py plist-dump --afc -b com.target.app -o ./plist_out
+```
+NSUserDefaults · CoreData · Cookies (parser binarycookies) · Caches · Screenshots ·
+Keyboard · Pasteboard · WebKit · CoreDataStores. Skill : ios-pentesting-tricks §7.
+
+### proxy — MITM + bypass pinning
+```bash
+python iphone_afu.py proxy --port 8080 --output capture.pcap
+python iphone_afu.py proxy --frida-bypass -b com.target.app
+python iphone_afu.py proxy --write-bypass bypass.js   # script seul
+```
+Génère le CA mitmproxy, le .mobileconfig (MDM si supporté, sinon manuel), lance
+mitmdump, et écrit/injecte le script Frida (SecTrust + TrustKit + Alamofire).
+Skills : traffic-analysis-pcap + mobile-ssl-pinning-bypass.
+
+### objection — recon runtime
+```bash
+python iphone_afu.py objection -b com.target.app                  # liste les presets
+python iphone_afu.py objection -b com.target.app --cmd cookies
+python iphone_afu.py objection -b com.target.app --batch -o ./obj_out
+python iphone_afu.py objection -b com.target.app --interactive
+```
+
+### network-recon — surface réseau (offline)
+```bash
+python iphone_afu.py network-recon --syslog-parse ./afu_out/syslog.txt --resolve -o ./network
+python iphone_afu.py network-recon --syslog-parse syslog.txt --geoip
+```
+Extrait domaines/IPs/URLs/connexions TCP du syslog, résolution DNS parallèle,
+GeoIP optionnel (ip-api.com). Skills : recon-and-methodology + traffic-analysis-pcap.
+
+### report — rapport HTML standalone
+```bash
+python iphone_afu.py report ./afu_out -o report.html
+```
+Dark theme, sidebar, badges de sévérité, zéro ressource externe.
+
 ### Keychain dump via Frida
 ```bash
 # Nécessite frida-server sur le device OU app re-signée avec gadget
@@ -224,12 +292,20 @@ Les tests ne nécessitent aucun device (pymobiledevice3 entièrement mocké).
 
 | Capacité | Commande |
 |---|---|
-| Protections binaire (PIE/canary/ARC/chiffrement) | `audit` |
-| Entitlements (get-task-allow, keychain groups, privés Apple) | `audit` |
-| Schémas URL + ATS (HTTP en clair, exceptions) | `audit` |
+| Protections binaire (PIE/canary/ARC/chiffrement) | `audit`, `macho` |
+| Bypass vectors + APIs anti-debug | `macho` |
+| Classes ObjC / symboles Swift statiques | `class-dump` |
+| Entitlements (get-task-allow, keychain groups, privés Apple) | `audit`, `macho` |
+| Schémas URL + ATS (HTTP en clair, exceptions) | `audit`, `macho` |
 | Universal Links / AASA (wildcards, content-type) | `aasa` |
-| Secrets en clair dans backup/container (JWT, tokens, clés) | `scan` |
-| Bypass SSL pinning (SecTrust/SSLHandshake) + détection JB | `bypass` |
+| Secrets en clair dans backup/container (JWT, tokens, clés) | `scan`, `strings-hunt` |
+| Score d'obfuscation binaire | `strings-hunt --obfuscation` |
+| Les 9 locations de data storage iOS | `plist-dump` |
+| Surface réseau (domaines/IPs/GeoIP depuis syslog) | `network-recon` |
+| Bypass SSL pinning (SecTrust/SSLHandshake) + détection JB | `bypass`, `proxy` |
+| MITM complet (CA + mobileconfig + mitmdump) | `proxy` |
+| Recon runtime (cookies, prefs, keychain, pasteboard…) | `objection` |
+| Rapport HTML consolidé | `report` |
 
 ---
 
