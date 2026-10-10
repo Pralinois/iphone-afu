@@ -1,0 +1,31 @@
+# Secrets / pairing records — ne jamais committer
+*.enc
+iphone_pair.json
+keychain_dump.json
+
+# Sorties d'extraction
+iphone_dcim*/
+iphone_backup*/
+photos_out/
+backup_out/
+manifest.json
+manifest.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Logs
+*.log
+
+# Artefacts Frida / sideload
+*.ipa
+*.dylib
+FridaGadget*
+
+# OS
+.DS_Store
+Thumbs.db
