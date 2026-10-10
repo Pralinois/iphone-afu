@@ -146,7 +146,7 @@ Les tests ne nécessitent aucun device (pymobiledevice3 entièrement mocké).
 | Permission USB denied | `sudo usermod -aG plugdev $USER` + reconnect session |
 | `Tunnel RemoteXPC non détecté` | `sudo python iphone_afu.py tunnel` (terminal dédié) |
 | Record `.enc` refusé | `--password` manquant/incorrect — vérifie le mot de passe |
-| VM ne voit pas le device | Activer USB passthrough VMware/VirtualBox — puis `python check_vm_usb.py` |
+| VM ne voit pas le device | Activer USB passthrough VMware/VirtualBox (ou `usbipd attach` en WSL2) — puis `python check_vm_usb.py` |
 
 ---
 
@@ -170,3 +170,29 @@ Les tests ne nécessitent aucun device (pymobiledevice3 entièrement mocké).
 2. **USB passthrough** : Settings → USB → Add device → Apple iPhone
 3. VMware garde la connexion USB plus stable que VirtualBox sur reconnect
 4. Lancer le setup depuis la VM — les drivers USB sont gérés par usbmuxd Linux
+
+### Alternative : WSL2 + usbipd-win
+
+Fonctionne (usbmuxd tourne dans WSL), avec un passthrough USB explicite :
+
+```powershell
+# Windows (admin) — installer puis attacher l'iPhone
+winget install usbipd
+usbipd list                  # repère le BUSID de l'iPhone
+usbipd bind --force --busid <X>
+usbipd attach --wsl --busid <X>
+```
+
+```bash
+# Dans WSL (Ubuntu)
+sudo apt install usbip usbutils   # si indisponible : linux-tools-generic + update-alternatives
+bash setup.sh
+source .venv/bin/activate
+sudo systemctl restart usbmuxd    # ou: sudo usbmuxd -f -v (WSL sans systemd)
+python iphone_afu.py check
+```
+
+Caveats WSL2 :
+- Pas d'udev → relancer usbmuxd après chaque `usbipd attach`
+- Reconnexions USB capricieuses → relancer `usbipd attach --wsl --busid <X>`
+- WSL1 ne supporte pas l'USB du tout (`wsl --set-version <distro> 2`)

@@ -19,11 +19,14 @@ sudo apt install -y \
   usbutils
 
 echo "[*] usbmuxd service..."
-sudo systemctl enable usbmuxd
-sudo systemctl start usbmuxd
+if sudo systemctl enable usbmuxd && sudo systemctl start usbmuxd; then
+  echo "    usbmuxd activé via systemd"
+else
+  echo "[!] systemd indisponible (WSL sans systemd ?) — lance usbmuxd manuellement: sudo usbmuxd -f -v"
+fi
 
 echo "[*] Groupe plugdev pour accès USB sans sudo..."
-sudo usermod -aG plugdev "$USER"
+sudo usermod -aG plugdev "$USER" 2>/dev/null || echo "[!] Groupe plugdev indisponible (normal en WSL — sans effet)"
 
 echo "[*] Venv Python..."
 python3 -m venv .venv
@@ -50,4 +53,5 @@ echo "    Tests          : python -m pytest tests/"
 echo "    Tunnel         : sudo python iphone_afu.py tunnel"
 echo ""
 echo "[!] Si VM : active le USB passthrough dans VMware/VirtualBox avant de brancher le téléphone."
+echo "[!] Si WSL2 : attache l'iPhone via usbipd-win (usbipd list → bind --force → attach --wsl) puis relance usbmuxd."
 echo "[!] Reconnecte ta session (ou source /etc/profile) pour que le groupe plugdev soit pris en compte."

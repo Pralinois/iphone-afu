@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Diagnostic USB + usbmuxd pour VM Linux.
-Détecte : VMware / VirtualBox / natif, état usbmuxd, device Apple visible, trust.
+Diagnostic USB + usbmuxd pour VM Linux / WSL2.
+Détecte : WSL2 / WSL1 / VMware / VirtualBox / natif, état usbmuxd, device Apple visible, trust.
 Usage: python check_vm_usb.py
 Exit code: 0 si tout OK, 1 si au moins un check échoue.
 """
@@ -42,12 +42,20 @@ def _read(path):
 
 
 def check_vm():
-    """Détecte l'hyperviseur : VMware / VirtualBox / KVM / bare-metal."""
+    """Détecte l'environnement : WSL2 / WSL1 / VMware / VirtualBox / KVM / bare-metal."""
     vendor = _read("/sys/class/dmi/id/sys_vendor")
     product = _read("/sys/class/dmi/id/product_name")
+    osrelease = _read("/proc/sys/kernel/osrelease").lower()
     cpuinfo = _read("/proc/cpuinfo").lower()
     haystack = f"{vendor} {product} {cpuinfo}".lower()
-    if "vmware" in haystack:
+    fix = None
+    if "wsl2" in osrelease:
+        vm = "WSL2"
+        fix = "Attache l'iPhone (Windows admin): usbipd list; usbipd bind --force --busid X; usbipd attach --wsl --busid X — puis dans WSL: sudo systemctl restart usbmuxd (ou sudo usbmuxd -f -v)"
+    elif "microsoft" in osrelease:
+        vm = "WSL1"
+        fix = "WSL1 ne supporte pas l'USB — migre: wsl --set-version <distro> 2"
+    elif "vmware" in haystack:
         vm = "VMware"
     elif "virtualbox" in haystack or "innotek" in haystack:
         vm = "VirtualBox"
@@ -59,7 +67,7 @@ def check_vm():
         rc, out = _run(["dmidecode", "-s", "system-product-name"])
         vm = out.strip() if rc == 0 else "inconnu"
     detail = f"{vendor} {product}".strip() or vm
-    return {"check": "Détection VM", "status": True, "detail": f"{vm} — {detail}", "fix": None}
+    return {"check": "Détection VM", "status": True, "detail": f"{vm} — {detail}", "fix": fix}
 
 
 def check_usbmuxd():
@@ -90,7 +98,7 @@ def check_apple_usb():
         "check": "Device Apple visible USB",
         "status": ok,
         "detail": devices[0] if devices else "aucun vendor Apple (05ac) sur le bus USB",
-        "fix": None if ok else "Active le USB passthrough (VM Settings → USB → Apple iPhone)",
+        "fix": None if ok else "Active le USB passthrough (VMware/VirtualBox) ou attache via usbipd (WSL2) — puis relance usbmuxd",
     }
 
 
