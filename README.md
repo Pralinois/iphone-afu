@@ -1,6 +1,6 @@
 # iPhone AFU Tool
 
-iOS 17/18 — A18 Pro — Linux natif / VM Linux sur Windows
+iOS 17/18 — A18 Pro — Linux natif / VM Linux / WSL2 sur Windows
 
 ---
 
@@ -10,6 +10,8 @@ iOS 17/18 — A18 Pro — Linux natif / VM Linux sur Windows
 bash setup.sh
 source .venv/bin/activate
 ```
+
+Guide complet de lancement (WSL2 pas-à-pas / VM / natif) : [docs/GUIDE_LANCEMENT.md](docs/GUIDE_LANCEMENT.md)
 
 ---
 
