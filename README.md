@@ -80,6 +80,37 @@ sudo python iphone_afu.py tunnel
 sudo python iphone_afu.py tunnel --keep-alive
 ```
 
+### Infos device + syslog
+```bash
+python iphone_afu.py info                       # infos détaillées (lockdown)
+python iphone_afu.py syslog -t 15 -o log.txt    # collecte le syslog
+```
+
+### Audit de sécurité (offline — aucun device requis)
+```bash
+# Audit statique d'un IPA/.app : protections Mach-O (PIE/canary/ARC/chiffrement),
+# entitlements, schémas URL, ATS. Rapport JSON optionnel.
+python iphone_afu.py audit app.ipa
+python iphone_afu.py audit Payload/Target.app --json rapport.json
+
+# Universal Links : analyse l'AASA du domaine (wildcards, content-type)
+python iphone_afu.py aasa target.com
+
+# Scan de données sensibles (backup/container) : cookies, prefs, sqlite,
+# secrets en clair (JWT, tokens, clés privées, mots de passe…)
+python iphone_afu.py scan ./backup_out --json findings.json
+```
+
+### Bypass runtime Frida (SSL pinning / jailbreak)
+```bash
+# Génère le script (à charger avec frida -U -f <bundle> -l script.js)
+python iphone_afu.py bypass --write bypass.js
+
+# Injecte directement sur le device (frida-server ou gadget sideload requis)
+python iphone_afu.py bypass -b com.target.app
+python iphone_afu.py bypass -b com.target.app --jailbreak
+```
+
 ### Keychain dump via Frida
 ```bash
 # Nécessite frida-server sur le device OU app re-signée avec gadget
@@ -163,6 +194,17 @@ Les tests ne nécessitent aucun device (pymobiledevice3 entièrement mocké).
 | Keychain (tokens background) | ⚠️ Frida gadget requis |
 | Filesystem complet | ❌ pas de jailbreak A18 public |
 | Mémoire live | ❌ |
+
+## Audit de sécurité (hors device)
+
+| Capacité | Commande |
+|---|---|
+| Protections binaire (PIE/canary/ARC/chiffrement) | `audit` |
+| Entitlements (get-task-allow, keychain groups, privés Apple) | `audit` |
+| Schémas URL + ATS (HTTP en clair, exceptions) | `audit` |
+| Universal Links / AASA (wildcards, content-type) | `aasa` |
+| Secrets en clair dans backup/container (JWT, tokens, clés) | `scan` |
+| Bypass SSL pinning (SecTrust/SSLHandshake) + détection JB | `bypass` |
 
 ---
 

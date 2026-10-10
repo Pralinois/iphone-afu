@@ -11,10 +11,13 @@
 - **DCIM** : extraction photos/vidéos + manifest `manifest.json` / `manifest.csv` (dates EXIF si Pillow installé)
 - **Backup** : backup complet Mobilebackup2 (option non chiffrée)
 - **Apps** : liste des apps installées
+- **Info/Syslog** : infos détaillées du device + collecte du syslog
 - **Tunnel** : wrapper RemoteXPC (iOS 17/18, sudo, `--keep-alive`)
-- **Keychain** : dump via Frida — branche optionnelle (frida-server ou gadget sideload)
-- **TUI** : interface Textual (check / pair / dcim / backup / apps / keychain)
-- **Tests** : 10 tests unitaires sans device (`pytest`)
+- **Keychain** : dump via Frida (comptage par classe) — branche optionnelle (frida-server ou gadget sideload)
+- **Audit (offline)** : IPA statique — protections Mach-O (PIE/canary/ARC/chiffrement), entitlements, schémas URL, ATS ; analyse AASA (Universal Links) ; scan de secrets (JWT/tokens/clés) dans backups
+- **Bypass** : scripts Frida SSL pinning (SecTrust/SSLHandshake) + détection jailbreak
+- **TUI** : interface Textual (check / pair / dcim / backup / apps / keychain / audit / scan)
+- **Tests** : 28 tests unitaires sans device (`pytest`)
 
 ---
 
@@ -126,8 +129,10 @@ python iphone_afu.py --record mon_iphone.json dcim -o ./photos_out
 # 3) Backup complet (non chiffré)
 python iphone_afu.py backup -o ./backup_out
 
-# 4) Liste des apps
+# 4) Liste des apps + infos device + syslog
 python iphone_afu.py apps
+python iphone_afu.py info
+python iphone_afu.py syslog -t 15 -o log.txt
 
 # 5) Tunnel RemoteXPC — iOS 17/18, terminal dédié
 sudo python iphone_afu.py tunnel --keep-alive
@@ -135,8 +140,17 @@ sudo python iphone_afu.py tunnel --keep-alive
 # 6) TUI
 python iphone_afu.py tui
 
-# 7) Tests (sans device) — attendu : 10 passed
+# 7) Tests (sans device) — attendu : 28 passed
 python -m pytest tests/
+
+# 8) Hors device — audit de sécurité
+python iphone_afu.py audit app.ipa --json rapport.json   # IPA statique
+python iphone_afu.py aasa target.com                     # Universal Links
+python iphone_afu.py scan ./backup_out                   # secrets en clair
+
+# 9) Bypass runtime (frida-server/gadget requis)
+python iphone_afu.py bypass --write bypass.js            # script seul
+python iphone_afu.py bypass -b com.target.app            # injection directe
 ```
 
 ---
@@ -163,7 +177,7 @@ python -m pytest tests/
 1. `uname -r` → contient `microsoft-standard-WSL2` (ou Linux natif/VM)
 2. `python3 --version` ≥ 3.10
 3. `bash setup.sh` → pas d'erreur bloquante. Les lignes `[!] systemd indisponible` / `[!] Groupe plugdev indisponible` sont **normales** sous WSL sans systemd (presque inoffensives)
-4. `python -m pytest tests/` → **10 passed** (aucun device requis — c'est le premier feu vert)
+4. `python -m pytest tests/` → **28 passed** (aucun device requis — c'est le premier feu vert)
 5. `usbmuxd` actif + `python iphone_afu.py check` → device visible avec trust ✓
 6. `python check_vm_usb.py` → exit code 0
 7. Première extraction : `pair` → `dcim` → vérifier que `manifest.json` + `manifest.csv` sont écrits dans le dossier de sortie

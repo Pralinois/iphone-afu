@@ -16,12 +16,19 @@ import csv
 import json
 import logging
 import os
+import plistlib
+import re
 import secrets
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.error
+import urllib.request
+import zipfile
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -568,7 +575,7 @@ function dumpKeychain() {
 dumpKeychain();
 """
 
-    result = {"status": "pending", "items": [], "error": None}
+    result = {"status": "pending", "items": [], "error": None, "by_class": {}}
 
     try:
         script_path = Path("/tmp/_frida_kc_dump.js")
@@ -589,6 +596,7 @@ dumpKeychain();
                 except Exception as e:
                     log.debug(f"dump_keychain_frida: parse ligne — {e}")
             result["status"] = "success"
+            result["by_class"] = summarize_keychain_items(result["items"])
             output_path.write_text(json.dumps(result["items"], indent=2))
         else:
             result["status"] = "error"
@@ -658,7 +666,7 @@ def export_manifest(manifest: list[dict], output_dir: Path) -> tuple[Path, Path]
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / "manifest.json"
     csv_path = output_dir / "manifest.csv"
-    json_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
+    json_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     with csv_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=["path", "size_bytes", "mtime", "ext", "exif_date"])
         writer.writeheader()
@@ -686,6 +694,522 @@ def _print_manifest_summary(manifest: list[dict], output_dir: Path):
         print(f"[+] manifest: {total} fichiers, {total_mb:.1f} MB")
         if dates:
             print(f"[+] EXIF {dates[0]} → {dates[-1]}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECURITY AUDIT — IPA statique (Mach-O/Info.plist), AASA, scan, bypass Frida
+# Playbooks: ios-pentesting-tricks §3/§4/§6/§7/§8, mobile-ssl-pinning-bypass §3.1
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MH_MAGIC_64 = 0xFEEDFACF
+MH_MAGIC = 0xFEEDFACE
+MH_CIGAM = 0xCEFAEDFE
+MH_CIGAM_64 = 0xCFFAEDFE
+MH_PIE = 0x200000
+LC_ENCRYPTION_INFO = 0x21
+LC_ENCRYPTION_INFO_64 = 0x2C
+LC_CODE_SIGNATURE = 0x1D
+FAT_MAGICS_BE = (0xCAFEBABE, 0xCAFEBABF)
+FAT_MAGICS_LE = (0xBEBAFECA, 0xBFBAFECA)
+CPU_NAMES = {12: "armv7", 0x01000007: "x86_64", 0x0100000C: "arm64"}
+ANY_TEAM_ID = ".*"
+
+SEVERITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
+SEVERITY_STYLE = {"HIGH": "red", "MEDIUM": "yellow", "LOW": "dim", "INFO": "cyan"}
+
+
+def _macho_slices(data: bytes) -> list[bytes]:
+    """Retourne les tranches Mach-O d'un binaire (fat → chaque arch, thin → le binaire)."""
+    if len(data) < 8:
+        return []
+    magic_be = int.from_bytes(data[:4], "big")
+    if magic_be in FAT_MAGICS_BE:
+        endian = "big"
+    elif magic_be in FAT_MAGICS_LE:
+        endian = "little"
+    else:
+        return [data]
+    is64 = magic_be in (0xCAFEBABF, 0xBFBAFECA)
+    nfat = int.from_bytes(data[4:8], endian)
+    entry = 32 if is64 else 20
+    out = []
+    for i in range(min(max(nfat, 0), 8)):
+        base = 8 + i * entry
+        if base + entry > len(data):
+            break
+        if is64:
+            off = int.from_bytes(data[base + 8:base + 16], endian)
+            size = int.from_bytes(data[base + 16:base + 24], endian)
+        else:
+            off = int.from_bytes(data[base + 8:base + 12], endian)
+            size = int.from_bytes(data[base + 12:base + 16], endian)
+        if off < len(data):
+            out.append(data[off:off + size])
+    return out
+
+
+def _parse_macho_header(data: bytes) -> Optional[dict]:
+    """Parse une tranche Mach-O : cputype/flags, cryptid (LC_ENCRYPTION_INFO), blob signature."""
+    if len(data) < 28:
+        return None
+    magic = int.from_bytes(data[:4], "little")
+    if magic in (MH_MAGIC_64, MH_MAGIC):
+        endian = "little"
+    elif magic in (MH_CIGAM, MH_CIGAM_64):
+        endian = "big"
+    else:
+        return None
+    is64 = magic in (MH_MAGIC_64, MH_CIGAM_64)
+
+    def u32(off):
+        return int.from_bytes(data[off:off + 4], endian)
+
+    ncmds = u32(16)
+    flags = u32(24)
+    cryptid = None
+    code_signature = None
+    off = 32 if is64 else 28
+    for _ in range(ncmds):
+        if off + 8 > len(data):
+            break
+        cmd = u32(off)
+        cmdsize = u32(off + 4)
+        if cmdsize < 8:
+            break
+        if cmd in (LC_ENCRYPTION_INFO, LC_ENCRYPTION_INFO_64) and cmdsize >= 20:
+            cryptid = u32(off + 16)
+        elif cmd == LC_CODE_SIGNATURE and cmdsize >= 16:
+            dataoff = u32(off + 8)
+            datasize = u32(off + 12)
+            if 0 < dataoff < len(data):
+                code_signature = data[dataoff:dataoff + datasize]
+        off += cmdsize
+    return {
+        "cputype": u32(4),
+        "cpusubtype": u32(8),
+        "flags": flags,
+        "cryptid": cryptid,
+        "code_signature": code_signature,
+    }
+
+
+def _cpu_name(cputype: int, cpusubtype: int) -> str:
+    name = CPU_NAMES.get(cputype, hex(cputype))
+    if name == "arm64" and cpusubtype & 0x80000000:   # PTRAUTH → arm64e
+        name = "arm64e"
+    return name
+
+
+def extract_entitlements(cs_data: Optional[bytes]) -> Optional[dict]:
+    """Extrait les entitlements XML depuis le blob LC_CODE_SIGNATURE (SuperBlob type 5)."""
+    if not cs_data or len(cs_data) < 20:
+        return None
+    if int.from_bytes(cs_data[:4], "big") != 0xFADE0CC0:   # SuperBlob
+        return None
+    count = int.from_bytes(cs_data[8:12], "big")
+    for i in range(min(count, 32)):
+        base = 12 + i * 8
+        if base + 8 > len(cs_data):
+            break
+        btype = int.from_bytes(cs_data[base:base + 4], "big")
+        boff = int.from_bytes(cs_data[base + 4:base + 8], "big")
+        if btype == 5 and 0 < boff and boff + 8 <= len(cs_data):    # CSSLOT_ENTITLEMENTS
+            blen = int.from_bytes(cs_data[boff + 4:boff + 8], "big")
+            if blen > 8 and boff + blen <= len(cs_data):
+                try:
+                    return plistlib.loads(cs_data[boff + 8:boff + blen])
+                except Exception as e:
+                    log.debug(f"extract_entitlements: plist — {e}")
+                    return None
+    return None
+
+
+def analyze_binary_data(data: bytes) -> dict:
+    """Analyse un binaire Mach-O (thin/fat) : archs, PIE/canary/ARC/cryptid, entitlements."""
+    out = {
+        "archs": [], "raw_ok": False, "pie": None, "canary": False,
+        "arc": False, "cryptid": None, "entitlements": None,
+    }
+    for chunk in _macho_slices(data):
+        hdr = _parse_macho_header(chunk)
+        if not hdr:
+            continue
+        out["raw_ok"] = True
+        out["archs"].append(_cpu_name(hdr["cputype"], hdr["cpusubtype"]))
+        pie = bool(hdr["flags"] & MH_PIE)
+        out["pie"] = pie if out["pie"] is None else (out["pie"] and pie)
+        if hdr["cryptid"] is not None:
+            out["cryptid"] = hdr["cryptid"] if out["cryptid"] is None else max(out["cryptid"], hdr["cryptid"])
+        if b"__stack_chk_guard" in chunk:
+            out["canary"] = True
+        if b"objc_release" in chunk:
+            out["arc"] = True
+        if out["entitlements"] is None and hdr["code_signature"]:
+            out["entitlements"] = extract_entitlements(hdr["code_signature"])
+    return out
+
+
+def load_app_bundle(path: Path) -> tuple[dict, bytes, str]:
+    """Charge Info.plist + binaire principal depuis un .ipa (zip) ou un dossier .app."""
+    if path.is_file() and path.suffix.lower() == ".ipa":
+        with zipfile.ZipFile(path) as zf:
+            plists = [n for n in zf.namelist()
+                      if n.startswith("Payload/") and n.endswith("/Info.plist") and n.count("/") == 2]
+            if not plists:
+                raise RuntimeError(f"Payload/*.app introuvable dans {path.name}")
+            app_dir = plists[0][:-len("Info.plist")]        # "Payload/Test.app/"
+            info = plistlib.loads(zf.read(plists[0]))
+            exe_name = info.get("CFBundleExecutable") or app_dir.rstrip("/").split("/")[-1][:-4]
+            return info, zf.read(app_dir + exe_name), exe_name
+    if path.is_dir():
+        info = plistlib.loads((path / "Info.plist").read_bytes())
+        exe_name = info.get("CFBundleExecutable") or path.stem
+        return info, (path / exe_name).read_bytes(), exe_name
+    raise RuntimeError(f"Chemin invalide (attendu .ipa ou .app) : {path}")
+
+
+def _url_schemes(info: dict) -> list[str]:
+    """Schémas URL déclarés dans CFBundleURLTypes."""
+    return [s for t in info.get("CFBundleURLTypes", []) for s in t.get("CFBundleURLSchemes", [])]
+
+
+def analyze_app_findings(info: dict, binary: dict) -> list[dict]:
+    """Findings de risque depuis Info.plist + analyse binaire (ios-pentesting-tricks §6/§8)."""
+    f = []
+
+    def add(sev, fid, title, detail):
+        f.append({"severity": sev, "id": fid, "title": title, "detail": detail})
+
+    ats = info.get("NSAppTransportSecurity") or {}
+    if ats.get("NSAllowsArbitraryLoads"):
+        add("HIGH", "ats-arbitrary", "ATS désactivé globalement",
+            "NSAllowsArbitraryLoads=true → HTTP en clair autorisé partout")
+    if ats.get("NSAllowsArbitraryLoadsInWebContent"):
+        add("MEDIUM", "ats-webcontent", "ATS désactivé pour WebView",
+            "NSAllowsArbitraryLoadsInWebContent=true → contenu web en HTTP")
+    domains = list((ats.get("NSExceptionDomains") or {}).keys())
+    if domains:
+        add("MEDIUM", "ats-exception", "Exceptions ATS par domaine",
+            f"{len(domains)} domaine(s) : {', '.join(domains[:5])}")
+
+    schemes = _url_schemes(info)
+    if schemes:
+        add("LOW", "schemes-custom", "Schémas URL custom (hijackables par nature)",
+            f"{len(schemes)} : {', '.join(schemes[:8])} — OAuth/callback via scheme = interception possible (§3)")
+    if any("oauth" in s.lower() or "callback" in s.lower() or "auth" in s.lower() for s in schemes):
+        add("MEDIUM", "oauth-scheme", "Schéma lié à l'auth/OAuth",
+            "Un schéma contenant oauth/callback/auth : risque de vol de code d'autorisation (§3.2)")
+
+    if binary.get("cryptid") == 1:
+        add("HIGH", "encrypted", "Binaire chiffré (FairPlay)",
+            "cryptid=1 → déchiffrer l'IPA avant analyse statique (§6.2)")
+    if binary.get("raw_ok"):
+        if binary.get("pie") is False:
+            add("HIGH", "no-pie", "PIE absent",
+                "ASLR désactivé → adresses prévisibles (§6.1)")
+        if not binary.get("canary"):
+            add("MEDIUM", "no-canary", "Stack canaries absents",
+                "__stack_chk_guard introuvable → overflow plus exploitable (§6.1)")
+        if not binary.get("arc"):
+            add("LOW", "no-arc", "ARC non détecté (heuristique)",
+                "objc_release absent → gestion mémoire manuelle, UAF plus probable (§6.1)")
+
+    ents = binary.get("entitlements") or {}
+    if ents.get("get-task-allow") is True:
+        add("HIGH", "debuggable", "App debuggable (get-task-allow)",
+            "entitlement get-task-allow=true → attachement debugger/Frida facilité")
+    priv = [k for k in ents if k.startswith("com.apple.private.")]
+    if priv:
+        add("INFO", "private-entitlements", "Entitlements privés Apple",
+            f"{len(priv)} : {', '.join(priv[:5])}")
+    groups = ents.get("keychain-access-groups")
+    if groups:
+        add("INFO", "keychain-groups", "keychain-access-groups", ", ".join(map(str, groups[:5])))
+    return sorted(f, key=lambda x: SEVERITY_ORDER.get(x["severity"], 9))
+
+
+def audit_app(path: Path) -> dict:
+    """Audit statique complet d'un IPA/.app : bundle, binaire, findings."""
+    log.debug(f"audit_app: {path}")
+    info, bin_data, exe_name = load_app_bundle(path)
+    binary = analyze_binary_data(bin_data)
+    findings = analyze_app_findings(info, binary)
+    return {
+        "path": str(path),
+        "executable": exe_name,
+        "bundle": {
+            "id": info.get("CFBundleIdentifier"),
+            "name": info.get("CFBundleDisplayName") or info.get("CFBundleName"),
+            "version": info.get("CFBundleShortVersionString"),
+            "min_os": info.get("MinimumOSVersion"),
+            "schemes": _url_schemes(info),
+            "ats": info.get("NSAppTransportSecurity") or {},
+        },
+        "binary": {
+            "archs": binary["archs"],
+            "pie": binary["pie"],
+            "canary": binary["canary"],
+            "arc": binary["arc"],
+            "cryptid": binary["cryptid"],
+            "entitlements": binary["entitlements"],
+        },
+        "findings": findings,
+    }
+
+
+def analyze_aasa(data: Optional[dict], content_type: str = "", status: int = 200) -> list[dict]:
+    """Findings Universal Links depuis l'AASA (ios-pentesting-tricks §4.1)."""
+    f = []
+    if status != 200 or data is None:
+        f.append({
+            "severity": "MEDIUM", "id": "aasa-missing",
+            "title": "AASA absent ou inaccessible",
+            "detail": f"HTTP {status} — pas d'association Universal Links → fallback vers schéma custom (hijackable, §4.1)",
+        })
+        return f
+    applinks = data.get("applinks") or data
+    details = applinks.get("details") or []
+    if not details:
+        f.append({
+            "severity": "MEDIUM", "id": "aasa-no-details",
+            "title": "AASA sans 'details'",
+            "detail": "Structure applinks.details manquante — Universal Links non associés",
+        })
+        return f
+    wildcard = []
+    app_ids = []
+    for d in details:
+        for p in d.get("paths") or []:
+            if "*" in str(p):
+                wildcard.append(str(p))
+        for c in d.get("components") or []:
+            for k, v in c.items():
+                if "*" in str(v):
+                    wildcard.append(f"{k}={v}")
+        app_ids += d.get("appIDs") or ([d["appID"]] if d.get("appID") else [])
+    if wildcard:
+        f.append({
+            "severity": "HIGH", "id": "aasa-wildcard",
+            "title": "AASA avec wildcard de chemins",
+            "detail": f"Patterns larges: {', '.join(wildcard[:5])} — l'app revendique des URL trop larges (§4.1)",
+        })
+    ct = (content_type or "").lower()
+    if ct and "json" not in ct:
+        f.append({
+            "severity": "MEDIUM", "id": "aasa-content-type",
+            "title": "Content-Type non JSON",
+            "detail": f"'{content_type}' — certains parseurs stricts rejettent l'AASA (§4.1)",
+        })
+    if app_ids:
+        f.append({"severity": "INFO", "id": "aasa-appids", "title": "App IDs associés",
+                  "detail": ", ".join(app_ids[:8])})
+    return sorted(f, key=lambda x: SEVERITY_ORDER.get(x["severity"], 9))
+
+
+def fetch_aasa(domain: str) -> tuple[int, str, Optional[dict]]:
+    """Récupère l'AASA (/.well-known puis racine). Retourne (status, content_type, json|None)."""
+    base = domain.strip().rstrip("/")
+    if not base.startswith("http"):
+        base = "https://" + base
+    last = (0, "", None)
+    for path in ("/.well-known/apple-app-site-association", "/apple-app-site-association"):
+        req = urllib.request.Request(base + path, headers={"User-Agent": "iphone-afu/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = resp.read()
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    data = None
+                return resp.status, resp.headers.get("Content-Type", ""), data
+        except urllib.error.HTTPError as e:
+            last = (e.code, "", None)
+        except Exception as e:
+            last = (0, str(e), None)
+    return last
+
+
+# ─── scan de données sensibles (§7.1) ────────────────────────────────────────
+
+SCAN_SKIP_EXT = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".gif", ".mov", ".mp4", ".m4a", ".aae"}
+SCAN_MAX_BYTES = 10 * 1024 * 1024
+
+STORAGE_NAME_PATTERNS = [
+    (re.compile(r"(?i)Snapshots[/\\]"), "screenshot", "LOW", "snapshot d'état d'app (§7.1)"),
+    (re.compile(r"(?i)Cookies\.binarycookies$"), "cookies", "MEDIUM", "cookies de session (§7.1)"),
+    (re.compile(r"(?i)keychain"), "keychain", "MEDIUM", "artefact keychain (§2/§7.1)"),
+    (re.compile(r"(?i)\.(sqlite3?|db|realm)$"), "sqlite", "LOW", "base locale — caches/API responses (§7.1)"),
+    (re.compile(r"(?i)Preferences[/\\].+\.plist$"), "nsuserdefaults", "LOW", "NSUserDefaults — tokens en clair possibles (§7.1)"),
+    (re.compile(r"(?i)Keyboard[/\\]"), "keyboard-cache", "LOW", "cache clavier (§7.1)"),
+]
+
+STORAGE_TITLES = {
+    "screenshot": "Snapshots d'app",
+    "cookies": "Cookies de session",
+    "keychain": "Artefact keychain",
+    "sqlite": "Base SQLite locale",
+    "nsuserdefaults": "NSUserDefaults (prefs)",
+    "keyboard-cache": "Cache clavier",
+}
+
+SECRET_PATTERNS = [
+    ("private-key", "HIGH", re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
+    ("github-token", "HIGH", re.compile(rb"gh[pousr]_[A-Za-z0-9]{36,}")),
+    ("jwt", "HIGH", re.compile(rb"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}")),
+    ("aws-key", "MEDIUM", re.compile(rb"AKIA[0-9A-Z]{16}")),
+    ("bearer-token", "MEDIUM", re.compile(rb"(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}")),
+    ("password", "MEDIUM", re.compile(rb"(?i)(?:password|passwd|pwd)\"?\s*[:=]\s*\"?[^\s\"<,;]{4,}")),
+    ("api-key", "MEDIUM", re.compile(rb"(?i)(?:api[_-]?key|apikey|secret[_-]?key|client[_-]?secret)\"?\s*[:=]\s*\"?[A-Za-z0-9_\-]{8,}")),
+]
+
+
+def scan_directory(root: Path) -> dict:
+    """Scanne un répertoire (backup/container/export) : fichiers sensibles + secrets en clair."""
+    result = {"root": str(root), "scanned_files": 0, "scanned_bytes": 0, "findings": []}
+    if not root.is_dir():
+        raise RuntimeError(f"Répertoire introuvable : {root}")
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = str(p.relative_to(root))
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        result["scanned_files"] += 1
+        result["scanned_bytes"] += size
+        for rx, fid, sev, detail in STORAGE_NAME_PATTERNS:
+            if rx.search(rel):
+                result["findings"].append({
+                    "path": rel, "id": fid, "severity": sev, "kind": "storage",
+                    "title": STORAGE_TITLES.get(fid, fid), "detail": detail, "sample": "",
+                })
+        if size > SCAN_MAX_BYTES or p.suffix.lower() in SCAN_SKIP_EXT:
+            continue
+        try:
+            blob = p.read_bytes()
+        except OSError:
+            continue
+        for fid, sev, rx in SECRET_PATTERNS:
+            m = rx.search(blob)
+            if m:
+                sample = m.group(0)[:80].decode("utf-8", errors="replace")
+                result["findings"].append({
+                    "path": rel, "id": fid, "severity": sev, "kind": "secret",
+                    "title": f"Secret en clair: {fid}",
+                    "detail": f"motif '{fid}' trouvé", "sample": sample,
+                })
+    result["findings"].sort(key=lambda x: SEVERITY_ORDER.get(x["severity"], 9))
+    log.debug(f"scan_directory: {result['scanned_files']} fichiers, {len(result['findings'])} findings")
+    return result
+
+
+# ─── bypass runtime Frida (mobile-ssl-pinning-bypass §3.1, IOS_RUNTIME_TRICKS §1.3) ──
+
+BYPASS_SSL_JS = r"""'use strict';
+// SSL pinning bypass — hooks SecTrust/SSLHandshake (non-jailbreak: gadget requis)
+function _hookExport(mod, name, retval) {
+    var addr = Module.findExportByName(mod, name);
+    if (!addr) { console.log('[bypass] ' + name + ' absent'); return; }
+    Interceptor.attach(addr, {
+        onLeave: function (rv) { rv.replace(ptr(retval)); console.log('[bypass] ' + name + ' -> ' + retval); }
+    });
+    console.log('[bypass] hook: ' + mod + '!' + name);
+}
+_hookExport('Security', 'SecTrustEvaluateWithError', 1);
+_hookExport('Security', 'SecTrustEvaluate', 0);
+var _hs = Module.findExportByName('Security', 'SSLHandshake');
+if (_hs) {
+    Interceptor.attach(_hs, {
+        onLeave: function (rv) {
+            if (rv.toInt32() === -9807) { rv.replace(ptr(0)); console.log('[bypass] SSLHandshake errSSLXCertChainInvalid -> 0'); }
+        }
+    });
+}
+var _th = Module.findExportByName('Security', 'tls_helper_create_peer_trust');
+if (_th) { Interceptor.attach(_th, { onLeave: function (rv) { rv.replace(ptr(1)); } }); }
+console.log('[+] SSL pinning bypass installé');
+"""
+
+BYPASS_JB_JS = r"""'use strict';
+// Jailbreak detection bypass (IOS_RUNTIME_TRICKS §1.3)
+var JB_PATHS = ['/Applications/Cydia.app','/usr/sbin/sshd','/bin/bash','/usr/bin/ssh','/etc/apt',
+    '/private/var/lib/apt/','/usr/local/bin/cycript','/var/lib/cydia','/var/jb',
+    '/Applications/Sileo.app','/Library/MobileSubstrate/MobileSubstrate.dylib'];
+try {
+    var _fm = ObjC.classes.NSFileManager;
+    Interceptor.attach(_fm['- fileExistsAtPath:'].implementation, {
+        onEnter: function (args) { this.path = ObjC.Object(args[2]).toString(); },
+        onLeave: function (rv) {
+            if (JB_PATHS.indexOf(this.path) !== -1) { rv.replace(ptr(0)); console.log('[jb] fileExistsAtPath bloqué: ' + this.path); }
+        }
+    });
+} catch (e) { console.log('[jb] NSFileManager hook échoué: ' + e); }
+try {
+    var _app = ObjC.classes.UIApplication;
+    Interceptor.attach(_app['- canOpenURL:'].implementation, {
+        onEnter: function (args) { this.url = ObjC.Object(args[2]).toString(); },
+        onLeave: function (rv) {
+            if (this.url.indexOf('cydia://') !== -1 || this.url.indexOf('sileo://') !== -1) { rv.replace(ptr(0)); }
+        }
+    });
+} catch (e) { console.log('[jb] canOpenURL hook échoué: ' + e); }
+var _fopen = Module.findExportByName(null, 'fopen');
+if (_fopen) {
+    Interceptor.attach(_fopen, {
+        onEnter: function (args) { this.path = args[0].readUtf8String(); },
+        onLeave: function (rv) {
+            if (this.path === '/bin/sh' || this.path === '/etc/fstab' || this.path === '/bin/bash') { rv.replace(ptr(0)); }
+        }
+    });
+}
+var _fork = Module.findExportByName(null, 'fork');
+if (_fork) { Interceptor.attach(_fork, { onLeave: function (rv) { rv.replace(ptr(-1)); } }); }
+console.log('[+] Jailbreak bypass installé');
+"""
+
+
+def build_bypass_script(ssl: bool = True, jailbreak: bool = False) -> str:
+    """Compose le script Frida de bypass (SSL par défaut, + jailbreak optionnel)."""
+    parts = []
+    if ssl:
+        parts.append(BYPASS_SSL_JS)
+    if jailbreak:
+        parts.append(BYPASS_JB_JS)
+    return "\n".join(parts)
+
+
+def _run_frida_script(bundle_id: str, script_text: str, timeout: int = 30) -> dict:
+    """Injecte un script Frida inline via le CLI (même approche que dump_keychain_frida)."""
+    result = {"status": "pending", "error": None, "stdout": ""}
+    script_path = Path(tempfile.gettempdir()) / "_frida_bypass.js"
+    try:
+        script_path.write_text(script_text)
+        proc = subprocess.run(
+            ["frida", "-U", "--no-pause", "-f", bundle_id, "-l", str(script_path)],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        result["stdout"] = proc.stdout[-2000:]
+        if proc.returncode == 0:
+            result["status"] = "success"
+        else:
+            result["status"] = "error"
+            result["error"] = (proc.stderr or proc.stdout)[:500]
+    except subprocess.TimeoutExpired:
+        result["status"] = "injected"
+        result["error"] = "frida toujours actif après %ss (hooks en place — Ctrl+C)" % timeout
+    except FileNotFoundError:
+        result["status"] = "error"
+        result["error"] = "frida non installé — pip install frida-tools"
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+    return result
+
+
+def summarize_keychain_items(items: list[dict]) -> dict:
+    """Compte les items keychain par classe (genp/inet/cert/keys/idnt)."""
+    return dict(sorted(Counter(str(it.get("class", "?")) for it in items).items()))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -903,8 +1427,12 @@ def cli_keychain(args):
         msg = f"{len(result['items'])} items → {out}"
         if RICH:
             console.print(f"[green]{msg}[/green]")
+            for cls, n in (result.get("by_class") or {}).items():
+                console.print(f"  [dim]{cls}: {n}[/dim]")
         else:
             print(f"[+] {msg}")
+            for cls, n in (result.get("by_class") or {}).items():
+                print(f"    {cls}: {n}")
     else:
         msg = f"Erreur: {result['error']}"
         if RICH:
@@ -976,16 +1504,267 @@ def cli_tunnel(args):
                 sys.exit(1)
 
 
+def _print_findings(findings: list[dict], title: str):
+    """Affiche une liste de findings security (Rich ou fallback)."""
+    has_path = any(fd.get("path") for fd in findings)
+    if RICH:
+        t = Table(title=f"{title} ({len(findings)})")
+        t.add_column("Sev", style="bold")
+        t.add_column("ID", style="dim")
+        if has_path:
+            t.add_column("Chemin", style="dim")
+        t.add_column("Titre")
+        t.add_column("Détail", style="dim")
+        for fd in findings:
+            style = SEVERITY_STYLE.get(fd["severity"], "white")
+            row = [f"[{style}]{fd['severity']}[/{style}]", fd.get("id", "?")]
+            if has_path:
+                row.append(fd.get("path", ""))
+            row += [fd.get("title", "—"), fd.get("detail", "")[:90]]
+            t.add_row(*row)
+        console.print(t)
+    else:
+        for fd in findings:
+            loc = f"{fd['path']} — " if fd.get("path") else ""
+            print(f"[{fd['severity']}] {loc}{fd.get('title', fd.get('id', '?'))} — {fd.get('detail', '')}")
+
+
+def cli_audit(args):
+    """Audit statique d'un IPA/.app (hors device)."""
+    path = Path(args.path)
+    try:
+        report = audit_app(path)
+    except Exception as e:
+        log.error(f"cli_audit: {e}")
+        msg = f"Audit impossible: {e}"
+        if RICH:
+            console.print(f"[red]{msg}[/red]")
+        else:
+            print(f"[!] {msg}")
+        return
+
+    if RICH:
+        b = report["bundle"]
+        binr = report["binary"]
+        console.print(Panel(
+            f"Bundle    : {b['id']} ({b['name']}) v{b['version']} — min OS {b['min_os']}\n"
+            f"Binaire   : {report['executable']} [{', '.join(binr['archs']) or '?'}]\n"
+            f"PIE={binr['pie']}  canary={binr['canary']}  ARC={binr['arc']}  cryptid={binr['cryptid']}\n"
+            f"Schemes   : {', '.join(b['schemes']) or '—'}\n"
+            f"Entitlements: {len(binr['entitlements'] or {})} clés",
+            title="Audit IPA", border_style="cyan",
+        ))
+        _print_findings(report["findings"], "Findings")
+    else:
+        for fd in report["findings"]:
+            print(f"[{fd['severity']}] {fd['id']}: {fd['detail']}")
+
+    if getattr(args, "json_out", None):
+        out = Path(args.json_out)
+        out.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        msg = f"Rapport JSON → {out}"
+        if RICH:
+            console.print(f"[green]{msg}[/green]")
+        else:
+            print(f"[+] {msg}")
+
+
+def cli_aasa(args):
+    """Analyse l'Apple-App-Site-Association d'un domaine."""
+    status, ctype, data = fetch_aasa(args.domain)
+    findings = analyze_aasa(data, ctype, status)
+    if RICH:
+        console.print(f"[cyan]AASA {args.domain} — HTTP {status} ({ctype or 'sans content-type'})[/cyan]")
+        _print_findings(findings, "Universal Links")
+    else:
+        print(f"[*] AASA {args.domain} — HTTP {status}")
+        for fd in findings:
+            print(f"[{fd['severity']}] {fd['id']}: {fd['detail']}")
+
+
+def cli_scan(args):
+    """Scanne un répertoire pour données sensibles."""
+    root = Path(args.path)
+    try:
+        result = scan_directory(root)
+    except RuntimeError as e:
+        if RICH:
+            console.print(f"[red]{e}[/red]")
+        else:
+            print(f"[!] {e}")
+        return
+    mb = result["scanned_bytes"] / (1024 * 1024)
+    if RICH:
+        console.print(f"[cyan]Scan {result['scanned_files']} fichiers ({mb:.1f} MB)[/cyan]")
+        _print_findings(result["findings"], "Données sensibles")
+    else:
+        print(f"[*] {result['scanned_files']} fichiers ({mb:.1f} MB)")
+        for fd in result["findings"]:
+            print(f"[{fd['severity']}] {fd['path']} — {fd['detail']} {fd['sample']}")
+    if getattr(args, "json_out", None):
+        Path(args.json_out).write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        if RICH:
+            console.print(f"[green]Findings JSON → {args.json_out}[/green]")
+        else:
+            print(f"[+] {args.json_out}")
+
+
+def cli_bypass(args):
+    """Génère/injecte un script Frida SSL pinning + jailbreak bypass."""
+    script = build_bypass_script(ssl=True, jailbreak=args.jailbreak)
+    if args.write:
+        out = Path(args.write)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(script)
+        msg = f"Script Frida → {out} (frida -U -f <bundle> -l {out})"
+        if RICH:
+            console.print(f"[green]{msg}[/green]")
+        else:
+            print(f"[+] {msg}")
+        return
+
+    if not args.bundle_id:
+        msg = "Bundle ID requis pour l'injection (ou utilise --write <fichier.js>)"
+        if RICH:
+            console.print(f"[red]{msg}[/red]")
+        else:
+            print(f"[!] {msg}")
+        return
+
+    if RICH:
+        console.print(f"[cyan]Injection Frida — {args.bundle_id}[/cyan]")
+        with console.status("Injection..."):
+            result = _run_frida_script(args.bundle_id, script)
+    else:
+        result = _run_frida_script(args.bundle_id, script)
+
+    if result["status"] in ("success", "injected"):
+        msg = f"Bypass actif sur {args.bundle_id}"
+        if RICH:
+            console.print(f"[green]{msg}[/green]")
+        else:
+            print(f"[+] {msg}")
+        if result.get("stdout"):
+            print(result["stdout"])
+    else:
+        msg = f"Erreur: {result['error']}"
+        if RICH:
+            console.print(f"[red]{msg}[/red]")
+        else:
+            print(f"[!] {msg}")
+
+
+INFO_KEYS = [
+    "DeviceName", "ProductType", "ProductVersion", "BuildVersion", "HardwareModel",
+    "BoardId", "UniqueDeviceID", "SerialNumber", "RegionInfo", "TimeZone",
+    "ActivationState", "IsPaired", "PasswordProtected", "CPUArchitecture",
+]
+
+
+def cli_info(args):
+    """Infos détaillées du device via lockdown."""
+    ctx = DeviceContext(
+        udid=getattr(args, "udid", None),
+        record_path=Path(args.record) if getattr(args, "record", None) else None,
+        password=getattr(args, "password", None),
+    )
+    try:
+        ld = ctx.resolve()
+    except RuntimeError as e:
+        if RICH:
+            console.print(f"[red]{e}[/red]")
+        else:
+            print(f"[!] {e}")
+        return
+
+    vals = {}
+    allv = getattr(ld, "all_values", None)
+    if isinstance(allv, dict):
+        vals.update(allv)
+    for k in INFO_KEYS:
+        if k not in vals:
+            try:
+                vals[k] = ld.get_value(key=k)
+            except Exception:
+                vals[k] = "—"
+
+    if RICH:
+        t = Table(title="Device")
+        t.add_column("Clé", style="cyan")
+        t.add_column("Valeur")
+        for k in INFO_KEYS:
+            t.add_row(k, str(vals.get(k, "—")))
+        console.print(t)
+    else:
+        for k in INFO_KEYS:
+            print(f"{k}\t{vals.get(k, '—')}")
+
+
+def cli_syslog(args):
+    """Collecte le syslog du device (pymobiledevice3 syslog collect)."""
+    ctx = DeviceContext(
+        udid=getattr(args, "udid", None),
+        record_path=Path(args.record) if getattr(args, "record", None) else None,
+        password=getattr(args, "password", None),
+    )
+    try:
+        ctx.resolve()
+    except RuntimeError as e:
+        if RICH:
+            console.print(f"[red]{e}[/red]")
+        else:
+            print(f"[!] {e}")
+        return
+
+    out = Path(args.output)
+    cmd = ["pymobiledevice3", "syslog", "collect", "--output", str(out)]
+    if getattr(args, "udid", None):
+        cmd += ["--udid", args.udid]
+    if args.timeout:
+        cmd += ["--timeout", str(args.timeout)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout + 60)
+    except FileNotFoundError:
+        msg = "pymobiledevice3 introuvable — active le venv (source .venv/bin/activate)"
+        if RICH:
+            console.print(f"[red]{msg}[/red]")
+        else:
+            print(f"[!] {msg}")
+        return
+    except subprocess.TimeoutExpired:
+        msg = f"Timeout syslog — fichier partiel: {out}"
+        if RICH:
+            console.print(f"[yellow]{msg}[/yellow]")
+        else:
+            print(f"[!] {msg}")
+        return
+
+    if proc.returncode == 0 and out.exists():
+        size_kb = out.stat().st_size // 1024
+        msg = f"Syslog ({args.timeout}s) → {out} ({size_kb}KB)"
+        if RICH:
+            console.print(f"[green]{msg}[/green]")
+        else:
+            print(f"[+] {msg}")
+    else:
+        msg = f"Syslog échoué: {(proc.stderr or proc.stdout or '')[:300]}"
+        log.error(f"cli_syslog: {msg}")
+        if RICH:
+            console.print(f"[red]{msg}[/red]")
+        else:
+            print(f"[!] {msg}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # TUI — Textual app
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if TEXTUAL:
-    class BundleInputModal(ModalScreen):
-        """Dialog modal pour saisir un bundle ID."""
+    class TextInputModal(ModalScreen):
+        """Dialog modal générique pour saisir un chemin / identifiant."""
 
         DEFAULT_CSS = """
-        BundleInputModal {
+        TextInputModal {
             align: center middle;
         }
         #modal-box {
@@ -997,17 +1776,22 @@ if TEXTUAL:
         }
         """
 
+        def __init__(self, prompt: str, placeholder: str = ""):
+            super().__init__()
+            self._prompt = prompt
+            self._placeholder = placeholder
+
         def compose(self) -> ComposeResult:
             with Vertical(id="modal-box"):
-                yield Label("Bundle ID de l'app cible :")
-                yield Input(placeholder="com.apple.mobilesafari", id="bundle-input")
+                yield Label(self._prompt)
+                yield Input(placeholder=self._placeholder, id="text-input")
                 with Horizontal():
                     yield Button("OK",     id="modal-ok",     variant="primary")
                     yield Button("Annuler",id="modal-cancel", variant="default")
 
         def on_button_pressed(self, event: Button.Pressed):
             if event.button.id == "modal-ok":
-                val = self.query_one("#bundle-input", Input).value.strip()
+                val = self.query_one("#text-input", Input).value.strip()
                 self.dismiss(val or None)
             else:
                 self.dismiss(None)
@@ -1045,6 +1829,8 @@ if TEXTUAL:
                 yield Button("💾 Full backup",    id="btn-backup",  variant="success")
                 yield Button("📱 List apps",      id="btn-apps",    variant="default")
                 yield Button("🔑 Keychain dump",  id="btn-keychain",variant="warning")
+                yield Button("🔎 Audit IPA",      id="btn-audit",   variant="default")
+                yield Button("🧪 Scan données",   id="btn-scan",    variant="default")
 
 
     class OutputPanel(Static):
@@ -1136,7 +1922,22 @@ if TEXTUAL:
                 self.run_worker(self._worker_apps())
 
             elif bid == "btn-keychain":
-                self.push_screen(BundleInputModal(), callback=self._on_bundle_id)
+                self.push_screen(
+                    TextInputModal("Bundle ID de l'app cible :", "com.apple.mobilesafari"),
+                    callback=self._on_bundle_id,
+                )
+
+            elif bid == "btn-audit":
+                self.push_screen(
+                    TextInputModal("Chemin de l'IPA ou du .app :", "C:/chemin/app.ipa"),
+                    callback=self._on_audit_path,
+                )
+
+            elif bid == "btn-scan":
+                self.push_screen(
+                    TextInputModal("Répertoire à scanner :", str(Path.home())),
+                    callback=self._on_scan_path,
+                )
 
         async def _worker_pair(self):
             ld = await asyncio.get_event_loop().run_in_executor(
@@ -1212,8 +2013,48 @@ if TEXTUAL:
             )
             if result["status"] == "success":
                 self._out(f"✓ {len(result['items'])} items → {out}")
+                for cls, n in (result.get("by_class") or {}).items():
+                    self._out(f"    {cls}: {n}")
             else:
                 self._out(f"✗ {result['error']}")
+
+        def _on_audit_path(self, path: Optional[str]):
+            if path:
+                self.run_worker(self._worker_audit(Path(path)))
+            else:
+                self._out("Audit annulé")
+
+        async def _worker_audit(self, path: Path):
+            self._out(f"Audit statique → {path}")
+            try:
+                report = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: audit_app(path)
+                )
+            except Exception as e:
+                self._out(f"✗ {e}")
+                return
+            for fd in report["findings"]:
+                self._out(f"  [{fd['severity']}] {fd['title']}")
+            self._out(f"✓ {len(report['findings'])} findings — {report['bundle']['id']}")
+
+        def _on_scan_path(self, path: Optional[str]):
+            if path:
+                self.run_worker(self._worker_scan(Path(path)))
+            else:
+                self._out("Scan annulé")
+
+        async def _worker_scan(self, path: Path):
+            self._out(f"Scan données sensibles → {path}")
+            try:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: scan_directory(path)
+                )
+            except RuntimeError as e:
+                self._out(f"✗ {e}")
+                return
+            for fd in result["findings"][:50]:
+                self._out(f"  [{fd['severity']}] {fd['path']} — {fd['detail']}")
+            self._out(f"✓ {result['scanned_files']} fichiers scannés, {len(result['findings'])} findings")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1266,6 +2107,34 @@ def main():
     p_tunnel = sub.add_parser("tunnel", help="Démarre le tunnel RemoteXPC (iOS 17/18, nécessite sudo)")
     p_tunnel.add_argument("--keep-alive", action="store_true", help="Relancer si le tunnel meurt")
 
+    # audit (offline)
+    p_audit = sub.add_parser("audit", help="Audit statique d'un IPA/.app (protections, ATS, schemes, entitlements)")
+    p_audit.add_argument("path", help="Chemin vers app.ipa ou Target.app")
+    p_audit.add_argument("--json", dest="json_out", help="Écrit le rapport complet en JSON")
+
+    # aasa (réseau)
+    p_aasa = sub.add_parser("aasa", help="Analyse l'Apple-App-Site-Association (Universal Links)")
+    p_aasa.add_argument("domain", help="Domaine cible (ex: target.com)")
+
+    # scan (offline)
+    p_scan = sub.add_parser("scan", help="Scanne un backup/container pour données sensibles")
+    p_scan.add_argument("path", help="Répertoire à scanner")
+    p_scan.add_argument("--json", dest="json_out", help="Écrit les findings en JSON")
+
+    # bypass (Frida)
+    p_bypass = sub.add_parser("bypass", help="Frida SSL pinning bypass (+ jailbreak bypass optionnel)")
+    p_bypass.add_argument("-b", "--bundle-id", dest="bundle_id", help="Bundle ID cible")
+    p_bypass.add_argument("--jailbreak", action="store_true", help="Ajoute le bypass de détection de jailbreak")
+    p_bypass.add_argument("--write", help="Écrit le script JS au lieu d'injecter")
+
+    # info (device)
+    sub.add_parser("info", help="Infos détaillées du device (lockdown)")
+
+    # syslog (device)
+    p_syslog = sub.add_parser("syslog", help="Collecte le syslog du device")
+    p_syslog.add_argument("-o", "--output", default="iphone_syslog.txt", help="Fichier de sortie")
+    p_syslog.add_argument("-t", "--timeout", type=int, default=10, help="Durée de collecte (secondes)")
+
     args = parser.parse_args()
 
     if args.cmd == "check":
@@ -1282,6 +2151,18 @@ def main():
         cli_keychain(args)
     elif args.cmd == "tunnel":
         cli_tunnel(args)
+    elif args.cmd == "audit":
+        cli_audit(args)
+    elif args.cmd == "aasa":
+        cli_aasa(args)
+    elif args.cmd == "scan":
+        cli_scan(args)
+    elif args.cmd == "bypass":
+        cli_bypass(args)
+    elif args.cmd == "info":
+        cli_info(args)
+    elif args.cmd == "syslog":
+        cli_syslog(args)
     elif args.cmd == "tui":
         if not TEXTUAL:
             print("[!] textual manquant — pip install textual")
