@@ -1,5 +1,7 @@
 # Secrets / pairing records — ne jamais committer
 *.enc
+*.plist
+*.mobileconfig
 iphone_pair.json
 keychain_dump.json
 

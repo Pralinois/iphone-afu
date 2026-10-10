@@ -43,3 +43,40 @@ def mock_afc_factory():
         return factory, afc
 
     return _make
+
+
+@pytest.fixture
+def valid_plist_record(tmp_path):
+    """Faux pairing record .plist avec les 4 champs requis (structure correcte)."""
+    import plistlib
+
+    record = {
+        "DeviceCertificate": b"FAKE_DEVICE_CERT",
+        "HostCertificate":   b"FAKE_HOST_CERT",
+        "RootCertificate":   b"FAKE_ROOT_CERT",
+        "HostPrivateKey":    b"FAKE_PRIVATE_KEY",
+        "HostID":            "AABBCCDD-1122-3344-5566-778899AABBCC",
+        "SystemBUID":        "DEADBEEF-DEAD-BEEF-DEAD-BEEFDEADBEEF",
+        "WiFiMACAddress":    "aa:bb:cc:dd:ee:ff",
+    }
+    udid = "00008130-001234567890ABCD"
+    plist_path = tmp_path / f"{udid}.plist"
+    plistlib.dump(record, plist_path.open("wb"))
+    return plist_path, udid, record
+
+
+@pytest.fixture
+def incomplete_plist_record(tmp_path):
+    """Pairing record sans HostPrivateKey — invalid."""
+    import plistlib
+
+    record = {
+        "DeviceCertificate": b"FAKE_DEVICE_CERT",
+        "HostCertificate":   b"FAKE_HOST_CERT",
+        "RootCertificate":   b"FAKE_ROOT_CERT",
+        # HostPrivateKey manquant
+        "HostID":            "AABBCCDD-1122-3344-5566-778899AABBCC",
+    }
+    plist_path = tmp_path / "incomplete.plist"
+    plistlib.dump(record, plist_path.open("wb"))
+    return plist_path

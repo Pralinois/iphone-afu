@@ -204,6 +204,24 @@ python iphone_afu.py report ./afu_out -o report.html
 ```
 Dark theme, sidebar, badges de sévérité, zéro ressource externe.
 
+### Pairing record — récupération & réutilisation (multi-machine)
+```bash
+# Localiser les records présents sur cette machine (iTunes, iMazing, 3uTools, lockdownd…)
+python iphone_afu.py record-find
+python iphone_afu.py record-find --udid <UDID> --export ./records_out/
+
+# Tester un record contre le device branché (5 étapes : parse → lockdown → AFU → AFC)
+python iphone_afu.py record-test ./mon_record.plist
+
+# Importer depuis une autre machine (installation aux emplacements standard)
+python iphone_afu.py record-import ./mon_record.plist --install --test
+```
+Guide complet (chemins par OS, cas BFU, Reset Location & Privacy) :
+[docs/PAIRING_RECORD_RECOVERY.md](docs/PAIRING_RECORD_RECOVERY.md)
+
+Le pipeline `auto` exécute automatiquement un record-test avant d'extraire quand un
+record est utilisé et qu'un device est branché (`--skip record-test` pour l'ignorer).
+
 ### Keychain dump via Frida
 ```bash
 # Nécessite frida-server sur le device OU app re-signée avec gadget

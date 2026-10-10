@@ -19,9 +19,10 @@
 - **v2 — RE statique** : `macho` (protections + bypass vectors + anti-debug), `class-dump` (classes ObjC / Swift), `strings-hunt` (secrets + entropie + score d'obfuscation)
 - **v2 — données** : `plist-dump` (9 locations de storage iOS), `network-recon` (surface réseau depuis syslog + DNS + GeoIP), `report` (HTML standalone)
 - **v2 — runtime** : `proxy` (MITM mitmproxy + CA + bypass pinning), `objection` (10 presets recon)
+- **v2.1 — pairing records** : `record-find`, `record-test`, `record-import` (réutilisation multi-machine, guide `docs/PAIRING_RECORD_RECOVERY.md`)
 - **TUI** : interface Textual (check / pair / dcim / backup / apps / keychain / audit / scan)
 - **Auto** : pipeline plug & play en une commande (`auto`/`plug` ou `auto.sh`)
-- **Tests** : 74 tests unitaires sans device (`pytest`)
+- **Tests** : 90 tests unitaires sans device (`pytest`)
 
 ---
 
@@ -178,6 +179,11 @@ python iphone_afu.py bypass --write bypass.js            # script seul
 python iphone_afu.py bypass -b com.target.app            # injection directe
 python iphone_afu.py proxy --port 8080 --frida-bypass -b com.target.app
 python iphone_afu.py objection -b com.target.app --batch -o ./obj_out
+
+# 10) Pairing record multi-machine (guide: docs/PAIRING_RECORD_RECOVERY.md)
+python iphone_afu.py record-find --export ./records_out/    # machine source
+python iphone_afu.py record-test ./records_out/<UDID>.plist # machine cible, device AFU
+python iphone_afu.py record-import ./mon_record.plist --install --test
 ```
 
 ---
@@ -204,7 +210,7 @@ python iphone_afu.py objection -b com.target.app --batch -o ./obj_out
 1. `uname -r` → contient `microsoft-standard-WSL2` (ou Linux natif/VM)
 2. `python3 --version` ≥ 3.10
 3. `bash setup.sh` → pas d'erreur bloquante. Les lignes `[!] systemd indisponible` / `[!] Groupe plugdev indisponible` sont **normales** sous WSL sans systemd (presque inoffensives)
-4. `python -m pytest tests/` → **74 passed** (aucun device requis — c'est le premier feu vert)
+4. `python -m pytest tests/` → **90 passed** (aucun device requis — c'est le premier feu vert)
 5. `python iphone_afu.py auto` → pipeline complet une fois le trust accepté (⚠ premier run : accepte « Faire confiance » sur l'écran)
 6. `usbmuxd` actif + `python iphone_afu.py check` → device visible avec trust ✓
 7. `python check_vm_usb.py` → exit code 0

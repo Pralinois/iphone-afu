@@ -5,6 +5,14 @@ Format: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — pairing record recovery & reuse
+- `record-find` — localise les pairing records multi-OS (iTunes, iMazing, 3uTools, lockdownd, `~/.iphone_afu/`) avec validation des 4 champs requis
+- `record-test` — test en 5 étapes contre le device branché (parse → lockdown → AFU → AFC → services)
+- `record-import` — import multi-machine + installation aux emplacements standard (Linux/macOS/Windows)
+- `auto` — étape record-test automatique avant extraction + `--skip record-test`
+- `docs/PAIRING_RECORD_RECOVERY.md` — guide complet (chemins par OS, BFU, Reset Location & Privacy)
+- 16 nouveaux tests (90 total, sans device)
+
 ### Added — v2 targets
 - `macho` — analyse Mach-O complète : PIE/canary/ARC/FairPlay + bypass vectors (skill: binary-protection-bypass)
 - `proxy` — MITM proxy mitmproxy + SSL pinning bypass Frida (skill: mobile-ssl-pinning-bypass)

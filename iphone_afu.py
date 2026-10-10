@@ -2189,6 +2189,170 @@ def cli_class_dump(args):
         print(text)
 
 
+def cli_record_find(args):
+    """Localise les pairing records existants sur cette machine."""
+    try:
+        from modules.record_finder import export_record, find_pairing_records, search_paths
+    except ImportError as e:
+        _module_error("record_finder", e)
+        return
+
+    records = find_pairing_records(target_udid=args.udid, platform=args.os)
+    if not records:
+        msg = "Aucun pairing record trouvé"
+        if RICH:
+            console.print(f"[red]{msg}[/red]")
+            console.print("[dim]Chemins scannés :[/dim]")
+            for p in search_paths(args.os):
+                console.print(f"  [dim]{p}[/dim]")
+        else:
+            print(f"[!] {msg}")
+            for p in search_paths(args.os):
+                print(f"    {p}")
+        return
+
+    if RICH:
+        t = Table(title=f"Pairing records ({len(records)})")
+        t.add_column("UDID", style="cyan")
+        t.add_column("Valid")
+        t.add_column("Chemin", style="dim")
+        t.add_column("WiFi MAC")
+        for r in records:
+            valid_str = "[green]✓[/green]" if r.valid else f"[yellow]⚠ {r.error or 'incomplet'}[/yellow]"
+            t.add_row(r.udid, valid_str, str(r.path), r.wifi_mac or "—")
+        console.print(t)
+    else:
+        for r in records:
+            print(f"{'OK' if r.valid else 'INCOMPLETE'} {r.udid} → {r.path}")
+
+    if args.export and records:
+        out = Path(args.export)
+        out.mkdir(parents=True, exist_ok=True)
+        exported = 0
+        for r in [rec for rec in records if rec.valid]:
+            dest = export_record(r, out)
+            msg = f"Exporté → {dest}"
+            if RICH:
+                console.print(f"[green]{msg}[/green]")
+            else:
+                print(f"[+] {msg}")
+            exported += 1
+        if exported == 0:
+            msg = "Aucun record valide à exporter (records incomplets)"
+            if RICH:
+                console.print(f"[yellow]{msg}[/yellow]")
+            else:
+                print(f"[!] {msg}")
+
+
+def cli_record_test(args):
+    """Teste un pairing record contre le device branché (5 étapes)."""
+    try:
+        from modules.record_finder import test_pairing_record
+    except ImportError as e:
+        _module_error("record_finder", e)
+        return
+
+    result = test_pairing_record(Path(args.record))
+    steps = [
+        ("Parse plist", result["step_1_parse"]),
+        ("Load LockdownClient", result["step_2_load"]),
+        ("AFU confirmé", result["step_3_afu"]),
+        ("AFC accessible", result["step_4_afc"]),
+    ]
+
+    if RICH:
+        for label, ok in steps:
+            icon = "[green]✓[/green]" if ok else "[red]✗[/red]"
+            console.print(f"  {icon} {label}")
+        if result["device_info"]:
+            d = result["device_info"]
+            console.print(f"\n  Device : {d.get('name')} | {d.get('ios')} | {d.get('model')}")
+        if result["step_5_services"]:
+            console.print(f"  Services : {len(result['step_5_services'])} disponibles")
+        if result["step_4_afc"]:
+            console.print("\n[green]✓ PHOTOS ET VIDÉOS ACCESSIBLES — lance:[/green]")
+            console.print(f"  python iphone_afu.py --record {args.record} dcim -o ./photos_out")
+        elif result["step_3_afu"] and not result["step_4_afc"]:
+            console.print("\n[yellow]⚠ Device en AFU mais AFC bloqué — record peut-être invalidé[/yellow]")
+            console.print("[yellow]  → Reset Location & Privacy côté phone : re-pair nécessaire[/yellow]")
+        elif not result["step_3_afu"]:
+            console.print("\n[red]✗ Device BFU ou record invalide — déverrouiller le phone d'abord[/red]")
+        if result["error"]:
+            console.print(f"[red]Erreur : {result['error']}[/red]")
+    else:
+        for label, ok in steps:
+            print(f"{'OK' if ok else 'FAIL'} {label}")
+        if result["device_info"]:
+            print(f"device: {result['device_info']}")
+        if result["error"]:
+            print(f"[!] {result['error']}")
+
+    sys.exit(0 if result["step_4_afc"] else 1)
+
+
+def cli_record_import(args):
+    """Importe un pairing record depuis une autre machine (+ installation optionnelle)."""
+    try:
+        from modules.record_finder import (install_pairing_record, install_paths,
+                                           test_pairing_record, validate_record)
+    except ImportError as e:
+        _module_error("record_finder", e)
+        return
+
+    src = Path(args.record)
+    rec = validate_record(src)
+    if not src.exists():
+        msg = f"Record introuvable : {src}"
+        if RICH:
+            console.print(f"[red]{msg}[/red]")
+        else:
+            print(f"[!] {msg}")
+        sys.exit(1)
+    if not rec.valid:
+        msg = f"Record incomplet ({rec.error}) — import risqué mais poursuivi"
+        if RICH:
+            console.print(f"[yellow]⚠ {msg}[/yellow]")
+        else:
+            print(f"[!] {msg}")
+
+    if args.install:
+        if RICH:
+            console.print("[cyan]Chemins d'installation :[/cyan]")
+            for p in install_paths():
+                console.print(f"  [dim]{p}[/dim]")
+        result = install_pairing_record(src)
+        for p in result["installed_paths"]:
+            msg = f"Installé → {p}"
+            if RICH:
+                console.print(f"[green]{msg}[/green]")
+            else:
+                print(f"[+] {msg}")
+        if result["error"]:
+            msg = f"Échec partiel/total : {result['error']} (sudo requis sur Linux ?)"
+            if RICH:
+                console.print(f"[yellow]{msg}[/yellow]")
+            else:
+                print(f"[!] {msg}")
+    else:
+        msg = f"Record valide ({rec.udid}) — relance avec --install pour l'installer"
+        if RICH:
+            console.print(f"[green]{msg}[/green]" if rec.valid else f"[yellow]{msg}[/yellow]")
+        else:
+            print(f"[+] {msg}" if rec.valid else f"[!] {msg}")
+
+    if args.test:
+        result = test_pairing_record(src)
+        ok = result["step_4_afc"]
+        msg = "Test : AFC accessible ✓" if ok else f"Test : échec ({result['error'] or 'AFC bloqué'})"
+        if RICH:
+            console.print(f"[green]{msg}[/green]" if ok else f"[red]{msg}[/red]")
+        else:
+            print(f"[+] {msg}" if ok else f"[!] {msg}")
+        if not ok:
+            sys.exit(1)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # AUTO — pipeline plug & play (device → extraction → analyse → rapport)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2344,6 +2508,25 @@ def run_auto(out_dir: Path, *, udid: Optional[str] = None, record_path: Optional
             report["stages"].append({"name": name, "status": "error", "detail": str(e),
                                      "seconds": round(time.time() - t0, 1)})
             emit(f"    ✗ {e}")
+
+    # ── record-test (record utilisé + device branché) : valide AVANT d'extraire ──
+    if (report["device"]["source"] or "").startswith("record") and record_path \
+            and "record-test" not in skip:
+        def _record_test():
+            from modules.record_finder import test_pairing_record
+            if not get_connected_devices():
+                return "aucun device branché — test du record ignoré"
+            test = test_pairing_record(Path(record_path))
+            if test["step_4_afc"]:
+                return "record valide — AFU + AFC OK (photos accessibles)"
+            if test["step_3_afu"]:
+                raise RuntimeError(
+                    "AFU OK mais AFC bloqué — Reset Location & Privacy probable : "
+                    "re-pair nécessaire (python iphone_afu.py pair -o nouveau_record.plist)")
+            raise RuntimeError(
+                "device BFU ou record invalide — déverrouille le phone une fois puis relance "
+                f"({test['error'] or 'pas de réponse AFU'})")
+        stage("record-test", _record_test)
 
     # ── info ──
     if "info" not in skip:
@@ -3034,6 +3217,28 @@ def main():
     p_cd.add_argument("--json", dest="json_out", help="Sortie JSON structurée")
     p_cd.add_argument("-o", "--output", help="Fichier texte de sortie")
 
+    # record-find
+    p_rf = sub.add_parser("record-find",
+                          help="Localise les pairing records existants sur cette machine")
+    p_rf.add_argument("--udid", help="Filtrer par UDID")
+    p_rf.add_argument("--os", choices=["windows", "mac", "linux"],
+                      help="OS source (défaut: auto-detect)")
+    p_rf.add_argument("--export", help="Copier le(s) record(s) trouvé(s) vers ce répertoire")
+
+    # record-test
+    p_rt = sub.add_parser("record-test",
+                          help="Teste un pairing record contre le device branché")
+    p_rt.add_argument("record", help="Chemin vers le .plist ou .json du record")
+
+    # record-import
+    p_ri = sub.add_parser("record-import",
+                          help="Importe un pairing record depuis une autre machine")
+    p_ri.add_argument("record", help="Chemin vers le .plist source")
+    p_ri.add_argument("--install", action="store_true",
+                      help="Installer au bon endroit (sudo peut être requis sur Linux)")
+    p_ri.add_argument("--test", action="store_true",
+                      help="Tester le record après import")
+
     args = parser.parse_args()
 
     if args.cmd == "check":
@@ -3080,6 +3285,12 @@ def main():
         cli_report(args)
     elif args.cmd == "class-dump":
         cli_class_dump(args)
+    elif args.cmd == "record-find":
+        cli_record_find(args)
+    elif args.cmd == "record-test":
+        cli_record_test(args)
+    elif args.cmd == "record-import":
+        cli_record_import(args)
     elif args.cmd == "tui":
         if not TEXTUAL:
             print("[!] textual manquant — pip install textual")
