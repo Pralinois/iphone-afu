@@ -3322,7 +3322,7 @@ def main():
     p_auto.add_argument("-t", "--timeout", type=int, default=120, help="Attente device/trust (secondes)")
     p_auto.add_argument("--password", help="Mot de passe du record chiffré (.enc)")
     p_auto.add_argument("--encrypted", action="store_true", help="Garder le backup chiffré")
-    p_auto.add_argument("--skip", help="Étapes à ignorer : info,apps,dcim,backup,syslog,scan,strings-hunt,network-recon,report")
+    p_auto.add_argument("--skip", help="Étapes à ignorer : info,apps,dcim,backup,syslog,scan,strings-hunt,network-recon,report,record-test")
     p_auto.add_argument("--syslog-timeout", type=int, default=10, dest="syslog_timeout",
                         help="Durée de collecte syslog (secondes)")
     p_auto.add_argument("--ipa", help="IPA local pour analyse statique (macho + class-dump)")

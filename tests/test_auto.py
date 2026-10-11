@@ -45,7 +45,9 @@ def test_run_auto_with_record_happy_path(tmp_path):
     rec.write_text("{}")
     out = tmp_path / "out"
     ctxs = _happy_patches(out)
-    with patch.object(m, "load_pairing_record", return_value=_fake_ld()):
+    # hermétique même avec un vrai téléphone branché (sinon l'étape record-test s'active)
+    with patch.object(m, "get_connected_devices", return_value=[]), \
+         patch.object(m, "load_pairing_record", return_value=_fake_ld()):
         for c in ctxs:
             c.start()
         try:
@@ -76,7 +78,8 @@ def test_run_auto_skip_stages(tmp_path):
     rec.write_text("{}")
     out = tmp_path / "out"
     ctxs = _happy_patches(out)
-    with patch.object(m, "load_pairing_record", return_value=_fake_ld()):
+    with patch.object(m, "get_connected_devices", return_value=[]), \
+         patch.object(m, "load_pairing_record", return_value=_fake_ld()):
         for c in ctxs:
             c.start()
         try:
@@ -115,6 +118,61 @@ def test_run_auto_pairs_live_and_saves_record(tmp_path):
     assert "device live" in report["device"]["source"]
 
 
+def test_run_auto_record_test_stage_ok(tmp_path):
+    """Étape record-test avec device branché : AFC OK → pipeline vert."""
+    rec = tmp_path / "rec.json"
+    rec.write_text("{}")
+    out = tmp_path / "out"
+    device = {"udid": "SIM-UDID", "name": "Simulated iPhone", "trusted": True,
+              "lockdown": MagicMock()}
+    ctxs = _happy_patches(out) + [patch.object(m, "get_connected_devices",
+                                               return_value=[device])]
+    record_test_ok = {"step_1_parse": True, "step_2_load": True, "step_3_afu": True,
+                      "step_4_afc": True, "step_5_services": [], "device_info": {},
+                      "error": None}
+    with patch.object(m, "load_pairing_record", return_value=_fake_ld()), \
+         patch("modules.record_finder.test_pairing_record", return_value=record_test_ok):
+        for c in ctxs:
+            c.start()
+        try:
+            report = run_auto(out, record_path=rec, wait=0, emit=NO_EMIT)
+        finally:
+            for c in ctxs:
+                c.stop()
+    stages = {s["name"]: s for s in report["stages"]}
+    assert "record-test" in stages
+    assert stages["record-test"]["status"] == "ok"
+    assert "AFC OK" in stages["record-test"]["detail"]
+    assert report["ok"] is True
+
+
+def test_run_auto_record_test_stage_afc_blocked(tmp_path):
+    """Étape record-test : AFU OK mais AFC bloqué → rapport en échec + conseil re-pair."""
+    rec = tmp_path / "rec.json"
+    rec.write_text("{}")
+    out = tmp_path / "out"
+    device = {"udid": "SIM-UDID", "name": "Simulated iPhone", "trusted": True,
+              "lockdown": MagicMock()}
+    ctxs = _happy_patches(out) + [patch.object(m, "get_connected_devices",
+                                               return_value=[device])]
+    record_test_blocked = {"step_1_parse": True, "step_2_load": True, "step_3_afu": True,
+                           "step_4_afc": False, "step_5_services": [], "device_info": {},
+                           "error": "AFC bloqué: escrow bag missing"}
+    with patch.object(m, "load_pairing_record", return_value=_fake_ld()), \
+         patch("modules.record_finder.test_pairing_record", return_value=record_test_blocked):
+        for c in ctxs:
+            c.start()
+        try:
+            report = run_auto(out, record_path=rec, wait=0, emit=NO_EMIT)
+        finally:
+            for c in ctxs:
+                c.stop()
+    stages = {s["name"]: s for s in report["stages"]}
+    assert stages["record-test"]["status"] == "error"
+    assert "Reset Location" in stages["record-test"]["detail"]
+    assert report["ok"] is False
+
+
 def test_run_auto_untrusted_device_trust_flow(tmp_path):
     out = tmp_path / "out"
     ld = _fake_ld()
@@ -150,6 +208,7 @@ def test_run_auto_v2_ipa_macho_classdump_and_report(tmp_path):
         return MagicMock(returncode=0, stdout="", stderr="")
 
     with patch.object(m, "load_pairing_record", return_value=_fake_ld()), \
+         patch.object(m, "get_connected_devices", return_value=[]), \
          patch.object(m, "tunnel_is_active", return_value=True), \
          patch.object(m, "collect_device_info", return_value={"DeviceName": "iPhone 16 Pro",
                                                               "ProductVersion": "18.4"}), \

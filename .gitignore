@@ -10,6 +10,13 @@ iphone_dcim*/
 iphone_backup*/
 photos_out/
 backup_out/
+mes_photos/
+iphone_photos_*/
+afu_out/
+plist_out/
+hunt_out/
+network_out/
+objection_out/
 manifest.json
 manifest.csv
 

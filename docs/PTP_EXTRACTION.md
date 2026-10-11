@@ -61,6 +61,32 @@ Structure préservée : `mes_photos/DCIM/APPLE100/IMG_xxxx.HEIC` + `manifest.jso
 
 ---
 
+## FAQ — le tap et le code
+
+**Faut-il le code de déverrouillage pour taper « Allow » ?**
+Non. Le code (ou Face ID) sert uniquement à **déverrouiller** le téléphone — le
+prompt « Allow » n'apparaît d'ailleurs que sur écran déverrouillé. Le tap
+« Allow » lui-même ne demande **aucun code**.
+
+**Y a-t-il une solution sans tap pour les photos ?**
+Non — c'est une contrainte iOS. Le prompt « Allow this device to access photos
+and videos? » est présenté à *tous* les outils PTP/caméra (Photos Windows,
+3uTools, iMazing, Image Capture, gphoto2…). Impossible de le contourner par PTP.
+Si le téléphone se reverrouille avant le tap : le déverrouiller suffit, la
+session PTP reprend (pas besoin de rebrancher).
+
+**Alors, quand est-ce qu'il n'y a vraiment aucun tap ?**
+Sur la voie **trust / pairing record** : une fois le téléphone appairé à cet
+ordinateur (un seul tap « Trust », `python iphone_afu.py pair`), le record
+stocké permet toutes les extractions suivantes **sans aucun tap** — il faut
+juste que le téléphone soit en état After-First-Unlock (déverrouillé au moins
+une fois depuis le dernier démarrage). Cette voie donne en plus de DCIM :
+backup, apps, keychain, syslog…
+Si un record existe déjà quelque part (ancien PC appairé, 3uTools, iMazing) :
+`python iphone_afu.py record-find` → `record-test` → `auto --record <fichier>`.
+
+---
+
 ## Les 5 états (mêmes messages des deux côtés)
 
 | État | Situation | Message / action |
