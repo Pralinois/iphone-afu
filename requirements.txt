@@ -11,6 +11,8 @@ macholib>=1.16.0
 mitmproxy>=10.0.0
 # optionnel — runtime RE (modules/objection_wrapper.py guarded)
 objection>=1.11.0
+# optionnel — extraction PTP (modules/ptp_extractor.py guarded, libgphoto2 système requis)
+gphoto2>=2.3.0
 
 # tests
 pytest>=7.0.0

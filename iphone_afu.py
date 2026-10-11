@@ -118,6 +118,13 @@ except ImportError:
 
 console = Console() if RICH else None
 
+# ─── compat pymobiledevice3 sync (4.x) / async (>=5.x) ──────────────────────
+try:
+    from modules.pymd3_compat import run_maybe_async as _maybe
+except ImportError:                     # modules/ absent (script isolé)
+    def _maybe(value):
+        return value
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CORE — fonctions bas niveau
@@ -137,18 +144,31 @@ def check_deps() -> dict:
     return results
 
 
+_usbmux_hint = ("usbmuxd/Apple Mobile Device Service injoignable — installe iTunes ou "
+                "l'app « Apple Devices » (Windows), ou démarre usbmuxd (Linux/WSL)")
+
+_LAST_DEVICE_ERROR: Optional[str] = None
+
+
+def last_device_error() -> Optional[str]:
+    """Dernière erreur de détection device (pour diagnostic CLI)."""
+    return _LAST_DEVICE_ERROR
+
+
 def get_connected_devices() -> list[dict]:
     """Retourne la liste des devices connectés avec leurs infos."""
+    global _LAST_DEVICE_ERROR
     log.debug("get_connected_devices: début")
     devices = []
     if not PMD3:
         log.debug("get_connected_devices: pymobiledevice3 indisponible — 0 device")
         return devices
     try:
-        raw = list_devices()
+        raw = _maybe(list_devices())
+        _LAST_DEVICE_ERROR = None
         for d in raw:
             try:
-                ld = create_using_usbmux(serial=d.serial)
+                ld = _maybe(create_using_usbmux(serial=d.serial))
                 info = {
                     "udid":       d.serial,
                     "name":       ld.display_name or "Unknown",
@@ -170,7 +190,8 @@ def get_connected_devices() -> list[dict]:
                 })
                 log.debug(f"get_connected_devices: {d.serial} not trusted — {e}")
     except Exception as e:
-        log.error(f"get_connected_devices: list_devices échoué — {e}")
+        _LAST_DEVICE_ERROR = f"{str(e) or type(e).__name__} — {_usbmux_hint}"
+        log.error(f"get_connected_devices: list_devices échoué — {_LAST_DEVICE_ERROR}")
     log.debug(f"get_connected_devices: {len(devices)} device(s)")
     return devices
 
@@ -265,7 +286,7 @@ def load_pairing_record(record_path: Path, password: Optional[str] = None) -> Op
             record = decrypt_pairing_record(record_path.read_bytes(), password)
         else:
             record = json.loads(record_path.read_text())
-        ld = create_using_usbmux(pair_record=record)
+        ld = _maybe(create_using_usbmux(pair_record=record))
         log.info(f"load_pairing_record: {record_path} chargé")
         return ld
     except ValueError:
@@ -291,8 +312,8 @@ def tunnel_is_active() -> bool:
     if not PMD3:
         return False
     try:
-        ld = create_using_usbmux(autopair=False)
-        ld.get_value(domain="com.apple.mobile.lockdown", key="ProductVersion")
+        ld = _maybe(create_using_usbmux(autopair=False))
+        _maybe(ld.get_value(domain="com.apple.mobile.lockdown", key="ProductVersion"))
         return True
     except Exception as e:
         log.debug(f"tunnel_is_active: probe lockdown — {e}")
@@ -387,11 +408,11 @@ class DeviceContext:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _afc_retry(fn, *args, retries: int = 3, delay: float = 1.5, on_retry=None, **kwargs):
-    """Retente fn jusqu'à retries fois avec backoff linéaire."""
+    """Retente fn jusqu'à retries fois avec backoff linéaire (sync ou coroutine)."""
     last_err = None
     for attempt in range(retries):
         try:
-            return fn(*args, **kwargs)
+            return _maybe(fn(*args, **kwargs))
         except Exception as e:
             last_err = e
             log.warning(f"AFC retry {attempt+1}/{retries} — {e}")
@@ -471,11 +492,11 @@ def extract_backup(lockdown: object, output_dir: Path, encrypted: bool = False) 
         if not encrypted:
             # Désactiver le chiffrement si actif
             try:
-                mb2.change_backup_password(old="", new="", enable_encryption=False)
+                _maybe(mb2.change_backup_password(old="", new="", enable_encryption=False))
             except Exception as e:
                 log.debug(f"extract_backup: change_backup_password — {e} (déjà désactivé ?)")
 
-        mb2.backup(full=True, backup_directory=output_dir)
+        _maybe(mb2.backup(full=True, backup_directory=output_dir))
         stats["status"] = "success"
         log.info(f"extract_backup: terminé → {output_dir}")
 
@@ -492,7 +513,7 @@ def extract_installed_apps(lockdown: object) -> list[dict]:
     apps = []
     try:
         svc = InstallationProxyService(lockdown)
-        raw = svc.get_apps(app_types=["User", "System"])
+        raw = _maybe(svc.get_apps(app_types=["User", "System"]))
         for bundle_id, info in raw.items():
             apps.append({
                 "bundle_id": bundle_id,
@@ -1241,11 +1262,15 @@ def cli_check(args):
             console.print(t2)
         else:
             console.print("[yellow]Aucun device détecté[/yellow]")
+            if last_device_error():
+                console.print(f"[dim]{last_device_error()}[/dim]")
         console.print(f"[dim]Log → {LOG_PATH}[/dim]")
     else:
         for k, v in deps.items():
             print(f"{'OK' if v else 'MISSING'} {k}")
         print(f"[log] {LOG_PATH}")
+        if last_device_error():
+            print(f"[!] {last_device_error()}")
 
 
 def cli_pair(args):
@@ -1669,7 +1694,7 @@ def collect_device_info(ld: object) -> dict:
     for k in INFO_KEYS:
         if k not in vals:
             try:
-                vals[k] = ld.get_value(key=k)
+                vals[k] = _maybe(ld.get_value(key=k))
             except Exception:
                 vals[k] = "—"
     return {k: vals.get(k, "—") for k in INFO_KEYS}
@@ -2351,6 +2376,157 @@ def cli_record_import(args):
             print(f"[+] {msg}" if ok else f"[!] {msg}")
         if not ok:
             sys.exit(1)
+
+
+def cli_ptp(args):
+    """Extraction PTP — zéro trust, zéro pairing record (phone déverrouillé requis)."""
+    try:
+        import gphoto2 as gp
+    except ImportError:
+        msg = "gphoto2 manquant — pip install gphoto2 && sudo apt install libgphoto2-dev"
+        if RICH:
+            console.print(f"[red]{msg}[/red]")
+        else:
+            print(f"[!] {msg}")
+        return
+
+    from modules.ptp_extractor import (build_manifest, detect_camera, extract_files, find_dcim_folder,
+                                       list_all_files, wait_for_unlock)
+
+    emit = (lambda m: console.print(m, highlight=False)) if RICH else print
+
+    if RICH:
+        console.print("[cyan]Extraction PTP — interface caméra (sans trust, sans pairing)[/cyan]")
+    camera = detect_camera(wait=True, timeout=120 if args.wait else 15, emit=emit)
+    if camera is None:
+        msg = "Aucun device PTP détecté — branche l'iPhone (déverrouillé)."
+        if RICH:
+            console.print(f"[red]{msg}[/red]")
+        else:
+            print(f"[!] {msg}")
+        sys.exit(1)
+
+    context = gp.Context()
+    dcim = find_dcim_folder(camera, context, emit=emit)
+    if dcim is None:
+        if args.wait:
+            dcim = wait_for_unlock(camera, context, timeout=120, emit=emit)
+        if dcim is None:
+            msg = ("DCIM inaccessible — États 2/3 : déverrouille l'iPhone et tape « Allow » "
+                   "sur l'écran, ou relance avec --wait")
+            if RICH:
+                console.print(f"[yellow]{msg}[/yellow]")
+            else:
+                print(f"[!] {msg}")
+            sys.exit(1)
+
+    files = list_all_files(camera, context, folder=dcim)
+    if args.max:
+        files = files[:args.max]
+    if not files:
+        msg = "Aucun média trouvé dans DCIM"
+        if RICH:
+            console.print(f"[yellow]{msg}[/yellow]")
+        else:
+            print(f"[!] {msg}")
+        return
+    if RICH:
+        console.print(f"[cyan]{len(files)} fichiers média — extraction → {args.output}[/cyan]")
+
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                      BarColumn(), TaskProgressColumn()) as progress:
+            task = progress.add_task("PTP…", total=len(files))
+
+            def cb(i, total, name, total_bytes):
+                progress.update(task, completed=i,
+                                description=f"{name} ({total_bytes // 1024 // 1024} MB)")
+
+            stats = extract_files(camera, context, files, Path(args.output),
+                                  resume=args.resume, progress_cb=cb)
+    else:
+        def cb(i, total, name, total_bytes):
+            print(f"  [{i}/{total}] {name} ({total_bytes // 1024 // 1024} MB)")
+
+        stats = extract_files(camera, context, files, Path(args.output),
+                              resume=args.resume, progress_cb=cb)
+
+    manifest_msg = ""
+    if not args.no_manifest:
+        m = build_manifest(Path(args.output))
+        manifest_msg = f"manifest: {m['files']} entrées → {m['manifest']}"
+
+    if RICH:
+        t = Table(title="Extraction PTP")
+        t.add_column("Résultat", style="cyan")
+        t.add_column("Valeur")
+        t.add_row("Copiés", str(stats["copied"]))
+        t.add_row("Skippés", str(stats["skipped"]))
+        t.add_row("Erreurs", str(stats["errors"]))
+        t.add_row("Total", f"{stats['total_bytes'] / 1024 / 1024:.1f} MB")
+        if manifest_msg:
+            t.add_row("Manifest", manifest_msg)
+        console.print(t)
+    else:
+        print(f"[+] {stats['copied']} copiés, {stats['skipped']} skippés, "
+              f"{stats['errors']} erreurs, {stats['total_bytes'] / 1024 / 1024:.1f} MB")
+        if manifest_msg:
+            print(f"[+] {manifest_msg}")
+
+
+def cli_ptp_check(args):
+    """Diagnostic PTP en 4 étapes."""
+    steps = []
+    try:
+        import gphoto2 as gp
+        steps.append(("libgphoto2 / gphoto2", True, f"python-gphoto2 {getattr(gp, '__version__', 'OK')}"))
+    except ImportError as e:
+        steps.append(("libgphoto2 / gphoto2", False, str(e)))
+
+    if steps[0][1]:
+        from modules.ptp_extractor import (detect_camera,
+                                           find_dcim_folder, list_all_files)
+        emit = (lambda m: console.print(m)) if RICH else print
+        camera = None
+        try:
+            camera = detect_camera(wait=False, timeout=0, emit=emit)
+        except Exception as e:
+            steps.append(("Device PTP détecté", False, str(e)))
+        if camera is not None:
+            steps.append(("Device PTP détecté", True, "camera initialisée"))
+            context = gp.Context()
+            dcim = find_dcim_folder(camera, context)
+            if dcim:
+                steps.append(("Storage DCIM accessible", True, dcim))
+                try:
+                    files = list_all_files(camera, context, folder=dcim)[:5]
+                    detail = ", ".join(str(f.name) for f in files) or "(vide)"
+                    steps.append(("Fichiers DCIM (5 premiers)", True, detail))
+                except Exception as e:
+                    steps.append(("Fichiers DCIM (5 premiers)", False, str(e)))
+            else:
+                steps.append(("Storage DCIM accessible", False,
+                              "déverrouille l'iPhone et tape « Allow »"))
+        else:
+            steps.append(("Device PTP détecté", False, "aucun device — branche l'iPhone"))
+
+    if RICH:
+        t = Table(title="Diagnostic PTP")
+        t.add_column("Étape", style="cyan")
+        t.add_column("Statut", style="bold")
+        t.add_column("Détail", style="dim")
+        for label, ok, detail in steps:
+            t.add_row(label, "[green]✓ OK[/green]" if ok else "[red]✗[/red]", detail[:80])
+        console.print(t)
+        if all(ok for _, ok, _ in steps):
+            console.print("[green]Prêt — lance: python iphone_afu.py ptp -o ./photos --wait[/green]")
+        else:
+            console.print("[yellow]Branche/déverrouille l'iPhone puis relance ptp-check[/yellow]")
+    else:
+        for label, ok, detail in steps:
+            print(f"{'OK' if ok else 'FAIL'} {label} — {detail}")
+
+    if not all(ok for _, ok, _ in steps):
+        sys.exit(1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3239,6 +3415,22 @@ def main():
     p_ri.add_argument("--test", action="store_true",
                       help="Tester le record après import")
 
+    # ptp
+    p_ptp = sub.add_parser("ptp",
+                           help="Extraction PTP — zéro trust, zéro pairing record (phone déverrouillé requis)")
+    p_ptp.add_argument("-o", "--output", default="./iphone_ptp_out")
+    p_ptp.add_argument("--wait", action="store_true",
+                       help="Attendre le déverrouillage (timeout 120s)")
+    p_ptp.add_argument("--resume", action="store_true",
+                       help="Reprendre une extraction interrompue")
+    p_ptp.add_argument("--no-manifest", action="store_true",
+                       help="Ne pas générer manifest.json")
+    p_ptp.add_argument("--max", type=int, default=0,
+                       help="Nombre max de fichiers (0 = tous)")
+
+    # ptp-check
+    sub.add_parser("ptp-check", help="Diagnostic PTP rapide (4 étapes)")
+
     args = parser.parse_args()
 
     if args.cmd == "check":
@@ -3291,6 +3483,10 @@ def main():
         cli_record_test(args)
     elif args.cmd == "record-import":
         cli_record_import(args)
+    elif args.cmd == "ptp":
+        cli_ptp(args)
+    elif args.cmd == "ptp-check":
+        cli_ptp_check(args)
     elif args.cmd == "tui":
         if not TEXTUAL:
             print("[!] textual manquant — pip install textual")

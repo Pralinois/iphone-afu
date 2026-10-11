@@ -32,6 +32,12 @@ try:
 except ImportError:
     PMD3 = False
 
+try:
+    from modules.pymd3_compat import run_maybe_async as _maybe
+except ImportError:                     # modules/ absent (script isolé)
+    def _maybe(value):
+        return value
+
 REQUIRED_FIELDS = ("DeviceCertificate", "HostCertificate",
                    "RootCertificate", "HostPrivateKey")
 
@@ -250,7 +256,7 @@ def test_pairing_record(record_path: Path) -> dict:
 
     # 2. LockdownClient
     try:
-        ld = create_using_usbmux(pair_record=data)
+        ld = _maybe(create_using_usbmux(pair_record=data))
     except Exception as e:
         result["error"] = f"lockdown : {e}"
         return result
@@ -258,7 +264,7 @@ def test_pairing_record(record_path: Path) -> dict:
 
     # 3. AFU confirmé (les valeurs device répondent)
     try:
-        product_version = ld.get_value(key="ProductVersion")
+        product_version = _maybe(ld.get_value(key="ProductVersion"))
         result["step_3_afu"] = bool(product_version)
         result["device_info"] = {
             "name": getattr(ld, "display_name", None),
@@ -273,7 +279,7 @@ def test_pairing_record(record_path: Path) -> dict:
     # 4. AFC accessible
     if result["step_3_afu"]:
         try:
-            entries = AfcService(ld).listdir("/")
+            entries = _maybe(AfcService(ld).listdir("/"))
             result["step_4_afc"] = entries is not None
         except Exception as e:
             result["error"] = f"AFC bloqué : {e}"

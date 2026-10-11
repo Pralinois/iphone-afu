@@ -36,6 +36,10 @@ echo "[*] Dépendances Python..."
 pip install --upgrade pip
 pip install -r requirements.txt
 
+echo "[*] libgphoto2 pour extraction PTP..."
+sudo apt install -y libgphoto2-dev gphoto2 || echo "[!] libgphoto2 indisponible (PTP désactivé)"
+pip install gphoto2 || echo "[!] python-gphoto2 indisponible (PTP désactivé)"
+
 echo "[*] pytest..."
 pip install pytest pytest-asyncio
 

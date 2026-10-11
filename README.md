@@ -222,6 +222,21 @@ Guide complet (chemins par OS, cas BFU, Reset Location & Privacy) :
 Le pipeline `auto` exécute automatiquement un record-test avant d'extraire quand un
 record est utilisé et qu'un device est branché (`--skip record-test` pour l'ignorer).
 
+### PTP — extraction zéro trust, zéro pairing record
+```bash
+# Linux/VM : diagnostic puis extraction (déverrouiller l'iPhone + « Allow » une fois)
+python iphone_afu.py ptp-check                    # 4 étapes (lib → device → DCIM → fichiers)
+python iphone_afu.py ptp -o ./photos --wait       # extraction + manifest
+python iphone_afu.py ptp -o ./photos --resume     # reprise
+```
+
+```powershell
+# Windows : natif (WPD), aucun install — brancher, déverrouiller, « Allow »
+.\wpd_media_export.ps1 -OutputDir .\mes_photos -Resume
+```
+Guide complet (5 états, limitations, diff PTP vs AFC) :
+[docs/PTP_EXTRACTION.md](docs/PTP_EXTRACTION.md)
+
 ### Keychain dump via Frida
 ```bash
 # Nécessite frida-server sur le device OU app re-signée avec gadget

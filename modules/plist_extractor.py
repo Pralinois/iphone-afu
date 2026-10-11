@@ -26,6 +26,12 @@ from typing import Optional
 
 log = logging.getLogger("afu.plist_extractor")
 
+try:
+    from modules.pymd3_compat import run_maybe_async as _maybe
+except ImportError:
+    def _maybe(value):
+        return value
+
 STORAGE_LOCATIONS = {
     "NSUserDefaults":   "Library/Preferences/*.plist",
     "CoreData":         "Library/Application Support/*.sqlite*",
@@ -268,10 +274,15 @@ def extract_all_storage_afc(lockdown, output_dir: Path,
             "utilise --backup (backup dézippé) à la place"
         ) from e
     try:
-        svc = HouseArrestService(lockdown, bundle_id)
-        afc = getattr(svc, "afc", svc)
+        # pymobiledevice3 ≥ 11 : factory async create(); anciennes versions : constructeur
+        if hasattr(HouseArrestService, "create"):
+            svc = _maybe(HouseArrestService.create(lockdown, bundle_id))
+        else:
+            # anciennes versions : __init__(lockdown, bundle_id)
+            svc = HouseArrestService(lockdown, bundle_id)  # type: ignore[arg-type]
     except Exception as e:
         raise RuntimeError(f"HouseArrest refusé pour {bundle_id} : {e}") from e
+    afc = getattr(svc, "afc", svc)
 
     staging = Path(output_dir) / "_afc_staging"
     staging.mkdir(parents=True, exist_ok=True)
@@ -280,7 +291,7 @@ def extract_all_storage_afc(lockdown, output_dir: Path,
         if depth > 6:
             return
         try:
-            entries = afc.listdir(remote)
+            entries = _maybe(afc.listdir(remote))
         except Exception:
             return
         local.mkdir(parents=True, exist_ok=True)
@@ -290,11 +301,11 @@ def extract_all_storage_afc(lockdown, output_dir: Path,
             rpath = f"{remote}/{entry}"
             lpath = local / entry
             try:
-                info = afc.stat(rpath)
+                info = _maybe(afc.stat(rpath))
                 if info.get("st_ifmt") == "S_IFDIR":
                     walk(rpath, lpath, depth + 1)
                 else:
-                    lpath.write_bytes(afc.get_file_contents(rpath))
+                    lpath.write_bytes(_maybe(afc.get_file_contents(rpath)))
             except Exception as e:
                 log.warning("AFC %s : %s", rpath, e)
 
@@ -303,6 +314,10 @@ def extract_all_storage_afc(lockdown, output_dir: Path,
         walk(remote, staging / remote)
 
     summary = extract_all_storage(staging, Path(output_dir), bundle_id=None)
+    try:
+        _maybe(svc.close())
+    except Exception as e:
+        log.debug("HouseArrest close: %s", e)
     shutil.rmtree(staging, ignore_errors=True)
     return summary
 
