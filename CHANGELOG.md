@@ -6,7 +6,7 @@ Format: [Semantic Versioning](https://semver.org/)
 ## [Unreleased]
 
 ### Added — guide recherche d'exploit iOS
-- `docs/EXPLOIT_RESEARCH.md` — matrice de faisabilité publique (checkm8, palera1n, Dopamine, kfd, TrollStore, FridaGadget), labo device legacy (achat, pin de version, delay OTA, exercices avec le toolkit), runtime sans jailbreak sur device moderne, implants matériels (O.MG : ce qu'ils peuvent/ne peuvent pas faire), pourquoi A18/iOS 18+ n'a aucun exploit public, rappels légaux
+- `docs/EXPLOIT_RESEARCH.md` — matrice de faisabilité publique (checkm8, palera1n, Dopamine, kfd, TrollStore, FridaGadget), labo device legacy (achat, pin de version, delay OTA, exercices avec le toolkit), runtime sans jailbreak sur device moderne, implants matériels (O.MG : ce qu'ils peuvent/ne peuvent pas faire), matrice état du device × trust × câble, pourquoi A18/iOS 18+ n'a aucun exploit public, rappels légaux
 - `docs/PTP_EXTRACTION.md` — FAQ tap/code (pas de code pour « Allow », tap-free uniquement via trust/record)
 
 ### Fixed — tests hermétiques avec un iPhone branché
