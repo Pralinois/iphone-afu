@@ -237,6 +237,9 @@ python iphone_afu.py ptp -o ./photos --resume     # reprise
 Guide complet (5 états, limitations, diff PTP vs AFC) :
 [docs/PTP_EXTRACTION.md](docs/PTP_EXTRACTION.md)
 
+FAQ tap/code + recherche d'exploit iOS (faisabilité checkm8/palera1n/Dopamine/TrollStore,
+labo device legacy, runtime sans jailbreak) : [docs/EXPLOIT_RESEARCH.md](docs/EXPLOIT_RESEARCH.md)
+
 ### Keychain dump via Frida
 ```bash
 # Nécessite frida-server sur le device OU app re-signée avec gadget

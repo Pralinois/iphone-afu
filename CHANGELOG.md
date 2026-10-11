@@ -5,6 +5,13 @@ Format: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — guide recherche d'exploit iOS
+- `docs/EXPLOIT_RESEARCH.md` — matrice de faisabilité publique (checkm8, palera1n, Dopamine, kfd, TrollStore, FridaGadget), labo device legacy (achat, pin de version, delay OTA, exercices avec le toolkit), runtime sans jailbreak sur device moderne, pourquoi A18/iOS 18+ n'a aucun exploit public, rappels légaux
+- `docs/PTP_EXTRACTION.md` — FAQ tap/code (pas de code pour « Allow », tap-free uniquement via trust/record)
+
+### Fixed — tests hermétiques avec un iPhone branché
+- tests `auto` : `get_connected_devices` piné dans les happy-path/v2 (l'étape `record-test` ne s'active plus à cause d'un vrai device) + 2 tests dédiés record-test (AFC OK / bloqué) — 105 tests, identiques avec ou sans device
+
 ### Added — PTP/WPD extraction (zéro trust, zéro pairing record)
 - `wpd_media_export.ps1` — extraction Windows native (WPD/COM) : détection device, 5 états interactifs, Resume, progression, retry stall 30s, `errors.txt`, `manifest.json`
 - `ptp` — extraction Linux via libgphoto2 (`--wait`, `--resume`, `--max`, `--no-manifest`, manifest JSON/CSV)
